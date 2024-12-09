@@ -1,6 +1,4 @@
-# k-melloddy
-# Preprocessor for Chemical Data
-
+# K-MELLODDY
 ## Overview
 This repository contains a Python-based preprocessing pipeline for K-MELLODDY standard data format, primarily designed for tasks in ADME/T prediction. The pipeline supports SMILES standardization, outlier detection, feature scaling, and label creation, making it suitable for classification and regression tasks.
 
