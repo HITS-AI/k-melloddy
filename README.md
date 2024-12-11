@@ -1,6 +1,7 @@
 # K-MELLODDY
 ## Overview
 This repository contains a Python-based preprocessing pipeline for K-MELLODDY standard data format, primarily designed for tasks in ADME/T prediction. The pipeline supports SMILES standardization, outlier detection, feature scaling, and label creation, making it suitable for classification and regression tasks.
+This repository will be updated when the K-MELLODDY standard data format is changed.
 
 ## Features
 - **SMILES Standardization**:
@@ -23,7 +24,7 @@ This repository contains a Python-based preprocessing pipeline for K-MELLODDY st
    git clone https://github.com/HITS-AI/k-melloddy.git
    cd k-melloddy
    ```
-2. Install the required dependencies:
+2. Install the required dependencies: (will be added soon)
    ```bash
    pip install -r requirements.txt
    ```
@@ -38,8 +39,8 @@ preprocessor = Preprocessor(
     input_path='data/chemical_data.csv',
     task='classification',
     task_name='solubility',
-    smiles_column='SMILES',
-    activity_column='Activity',
+    smiles_column='SMILES_Structure_Parent',
+    activity_column='Measurement_Value',
     remove_salt=True,
     keep_stereo=False,
     keep_duplicates=False,
