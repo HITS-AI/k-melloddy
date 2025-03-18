@@ -1,0 +1,17 @@
+Chemical ID,Standardized_SMILES,Scaffold,Measurement_Value_scaled,Measurement_Value,Test,Test_Type,Test_Subject,Measurement_Type
+CHEMBL5267127,COc1ccc(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)cc1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-2.495770310539891,3.03,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271332,CC(C)Oc1ccc(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)cc1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-1.0540762429708623,3.78,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271334,Cc1cc(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)ccc1Cl,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.80418260459223,3.91,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271336,O=C(Nc1ccc(Br)cc1)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.8810729548625782,3.87,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271370,CC(C)c1ccc(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)cc1C(C)C,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,1.0027406267609518,4.85,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271372,O=C(Nc1ccc(Cl)c(Cl)c1)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.5350663786460119,4.05,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271374,O=C(Nc1ccc(I)c(I)c1)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,0.23383712405747076,4.45,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271376,Cc1cc(C)cc(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)c1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.7272922543218817,3.95,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271378,O=C(Nc1cc(Cl)cc(Cl)c1)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.400508265672902,4.12,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271380,O=C(Nc1cc(I)cc(I)c1)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,0.3683952370305789,4.52,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271382,Cc1cccc(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)c1C,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.5927341413487736,4.02,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271384,O=C(Nc1cccc(Cl)c1Cl)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.2851727402673805,4.18,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271386,O=C(Nc1cccc(I)c1I)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,0.4837307624361022,4.58,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271388,Cc1cc(C)c(NC(=O)c2cc3sc(N4CCNCC4)nc3s2)c(C)c1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.4773986159432503,4.08,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271390,O=C(Nc1c(Cl)cc(Cl)cc1Cl)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,-0.15061462729427058,4.25,Physicochem,ClogP,Not specified,Not specified
+CHEMBL5271392,O=C(Nc1c(I)cc(I)cc1I)c1cc2sc(N3CCNCC3)nc2s1,O=C(Nc1ccccc1)c1cc2sc(N3CCNCC3)nc2s1,0.6182888754092121,4.65,Physicochem,ClogP,Not specified,Not specified
