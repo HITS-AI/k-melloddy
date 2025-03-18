@@ -7,6 +7,7 @@ import logging
 import matplotlib.pyplot as plt
 import seaborn as sns
 import datetime
+import re
 
 from argparse import ArgumentParser
 from typing import Iterable, List, Tuple, Dict, Any, Optional
@@ -97,18 +98,55 @@ class DataInspector:
         self.df = self.load_data(input_path)
     
     def load_data(self, input_path):
-        if not input_path.endswith('.csv'):
-            raise ValueError(f"Input file must be a CSV file. Current file is: {input_path}")
-        self.df = pd.read_csv(input_path).fillna("Not specified")
-        if self.smiles_col not in self.df.columns:
+        # Check if file exists
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+            
+        # Determine file type based on extension
+        file_extension = os.path.splitext(input_path)[1].lower()
+        
+        if file_extension == '.csv':
+            logger.info(f"Loading CSV file: {input_path}")
+            df = pd.read_csv(input_path).fillna("Not specified")
+        elif file_extension in ['.xlsx', '.xls']:
+            logger.info(f"Loading Excel file: {input_path}")
+            # Read both ADMET and PK sheets if they exist
+            excel_file = pd.ExcelFile(input_path)
+            sheets = excel_file.sheet_names
+            
+            dfs = []
+            if 'ADMET' in sheets:
+                logger.info("Reading ADMET sheet")
+                admet_df = pd.read_excel(excel_file, sheet_name='ADMET').fillna("Not specified")
+                dfs.append(admet_df)
+            
+            if 'PK' in sheets:
+                logger.info("Reading PK sheet")
+                pk_df = pd.read_excel(excel_file, sheet_name='PK').fillna("Not specified")
+                dfs.append(pk_df)
+                
+            if not dfs:
+                # If no specific sheets found, read the first sheet
+                logger.warning(f"No ADMET or PK sheets found in {input_path}. Reading first sheet.")
+                df = pd.read_excel(excel_file, sheet_name=0).fillna("Not specified")
+            else:
+                # Combine all sheets
+                df = pd.concat(dfs, ignore_index=True)
+                logger.info(f"Combined data from sheets. Total rows: {len(df)}")
+        else:
+            raise ValueError(f"Unsupported file format: {file_extension}. Please use CSV or Excel files.")
+        
+        # Validate required columns
+        if self.smiles_col not in df.columns:
             raise ValueError(f"SMILES column '{self.smiles_col}' not found in data.")
         
-        if self.activity_col in self.df.columns:
+        # Process activity column if it exists
+        if self.activity_col in df.columns:
             try:
-                self.df[self.activity_col] = self.df[self.activity_col].astype(str)
+                df[self.activity_col] = df[self.activity_col].astype(str)
                 
                 numeric_pattern = r'^[<>]?\s*\d+\.?\d*$'
-                non_numeric_mask = ~self.df[self.activity_col].str.match(numeric_pattern)
+                non_numeric_mask = ~df[self.activity_col].str.match(numeric_pattern)
                 
                 if non_numeric_mask.any():
                     logger.info(f"Activity column '{self.activity_col}' contains non-numeric values. These will be handled as categorical.")
@@ -116,8 +154,44 @@ class DataInspector:
                 logger.warning(f"Error analyzing activity column: {e}")
         else:
             logger.warning(f"Activity column '{self.activity_col}' not found in data. Some functionality may be limited.")
-            
-        return self.df
+
+        # Replace special characters in column values
+        for col in df.columns:
+            if df[col].dtype == 'object':  # Only process string columns
+                # Replace μ (micro) with u
+                df[col] = df[col].astype(str).str.replace('μ', 'u')
+                # Replace other potentially problematic unicode characters
+                df[col] = df[col].apply(lambda x: self._replace_special_chars(x) if isinstance(x, str) else x)
+                
+        # Ensure all condition columns exist
+        for col in self.condition_columns:
+            if col not in df.columns:
+                logger.warning(f"Condition column '{col}' not found in data. Creating empty column.")
+                df[col] = "Not specified"
+                
+        return df
+    
+    def _replace_special_chars(self, text):
+        """Replace special characters that might cause issues"""
+        # Map of special characters to their replacements
+        replacements = {
+            'μ': 'u',       # micro
+            '°': 'deg',     # degree
+            'α': 'alpha',   # alpha
+            'β': 'beta',    # beta
+            'γ': 'gamma',   # gamma
+            'δ': 'delta',   # delta
+            '±': '+/-',     # plus-minus
+            '≤': '<=',      # less than or equal
+            '≥': '>=',      # greater than or equal
+            '×': 'x',       # multiplication
+            '÷': '/',       # division
+        }
+        
+        for char, replacement in replacements.items():
+            text = text.replace(char, replacement)
+        
+        return text
 
     def extract_valid_data(self):
         groups = self.df.groupby(self.condition_columns)
@@ -222,23 +296,84 @@ class Preprocessor:
         self.remover = SaltRemover.SaltRemover()
         self.uncharger = MolStandardize.rdMolStandardize.Uncharger()
         self.enumerator = MolStandardize.rdMolStandardize.TautomerEnumerator()
+        
+        # Add Test_Dose to final columns for Pharmacokinetics tests
+        if 'Test' in self.df.columns and 'Pharmacokinetics' in self.df['Test'].values:
+            if 'Test_Dose' in self.df.columns:
+                logger.info("Pharmacokinetics test detected. Test_Dose column will be included in output.")
+                self.final_cols.append('Test_Dose')
+            else:
+                logger.warning("Pharmacokinetics test detected but Test_Dose column not found. Adding with default value.")
+                self.df['Test_Dose'] = "Unknown"
+                self.final_cols.append('Test_Dose')
+        
+        # Check if Chemical_ID column exists
+        self.has_chemical_id = False
+        if 'Chemical ID' in self.df.columns:
+            self.has_chemical_id = True
+            self.final_cols.append('Chemical ID')
 
     def check_task(self, task_type, task=None):
+        """
+        Check if task type and task information are valid based on valid_options.csv
+        """
         if task_type.lower() not in ['classification', 'regression']:
             raise ValueError(f"Task should be specified (Classification or Regression). Current task: {task_type}")
         self.task_type = task_type.lower()
         
         if task is not None:
-            main_tasks = [
-                'solubility', 'caco-2', 'pampa', 'ppb', 'p-gp',
-                'microsomal-stability', 'cyp1a2 inhibition', 'cyp2c9 inhibition',
-                'cyp2c19 inhibition', 'cyp2d6 inhibition', 'cyp3a inhibition',
-                'herg inhibition', 'ames test'
-            ]
-            task_lower = task.lower() if isinstance(task, str) else task
-            if task_lower not in main_tasks:
-                print(f"Warning: Task '{task}' is not in the list of recognized tasks.")
-            self.task = task_lower
+            # Load valid options from csv
+            options_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "valid_options.csv")
+            
+            try:
+                if os.path.exists(options_file):
+                    valid_options = pd.read_csv(options_file)
+                    
+                    # Get unique valid values for each column
+                    valid_tests = set(valid_options['Test'].dropna())
+                    valid_test_types = set(valid_options['Test_Type'].dropna())
+                    valid_measurement_types = set(valid_options['Measurement_Type'].dropna())
+                    
+                    # Check task components based on type
+                    task_components = []
+                    
+                    # Handle different types of task input
+                    if isinstance(task, (list, tuple)):
+                        # If task is already a tuple or list, use its elements directly
+                        task_components = task
+                    else:
+                        # If task is a string, split by pipe character
+                        task_components = str(task).split('|')
+                    
+                    # First component should be a Test value
+                    if len(task_components) >= 1:
+                        test_value = task_components[0]
+                        if isinstance(test_value, str):
+                            test_value = test_value.strip()
+                        if test_value not in valid_tests and test_value != "Not specified":
+                            logger.warning(f"Test '{test_value}' is not in the list of recognized tests.")
+                    
+                    # Second component should be a Test_Type value
+                    if len(task_components) >= 2:
+                        test_type_value = task_components[1]
+                        if isinstance(test_type_value, str):
+                            test_type_value = test_type_value.strip()
+                        if test_type_value not in valid_test_types and test_type_value != "Not specified":
+                            logger.warning(f"Test_Type '{test_type_value}' is not in the list of recognized test types.")
+                    
+                    # Fourth component (if exists) should be a Measurement_Type value
+                    if len(task_components) >= 4:
+                        measurement_type_value = task_components[3]
+                        if isinstance(measurement_type_value, str):
+                            measurement_type_value = measurement_type_value.strip()
+                        if measurement_type_value not in valid_measurement_types and measurement_type_value != "Not specified":
+                            logger.warning(f"Measurement_Type '{measurement_type_value}' is not in the list of recognized measurement types.")
+                else:
+                    logger.warning(f"Valid options file not found: {options_file}. Skipping validation.")
+            except Exception as e:
+                logger.warning(f"Error validating task against valid_options.csv: {e}. Continuing without validation.")
+            
+            self.task = task
         
     def inspect_label(self):
         unique_labels = self.df[self.activity_col].dropna().unique()
@@ -276,7 +411,7 @@ class Preprocessor:
 
     def inspect_compound_id(self):
         cols = [each.lower() for each in self.df.columns]
-        if 'Chemical_ID' in cols:
+        if 'Chemical ID' in cols:
             self.is_compound_id = True
             
     def preprocess_compound(self, smiles:str) -> str:
@@ -493,8 +628,47 @@ class Preprocessor:
         if self.detect_outliers:
             self.detect_outlier_from_distribution()
             self.df.drop(self.outliers.index, inplace=True)
-        if not self.keep_duplicates:
+            
+        # Improved duplicate removal logic
+        # Skip duplicate removal for Pharmacokinetics data
+        is_pk_data = False
+        # Check either Test or Test_Type columns for Pharmacokinetics
+        if 'Test' in self.df.columns and 'Pharmacokinetics' in self.df['Test'].values:
+            is_pk_data = True
+            logger.info("Pharmacokinetics data detected. Skipping duplicate removal to preserve multiple measurements.")
+        
+        if not self.keep_duplicates and not is_pk_data:
+            # Record data count before duplicate removal
+            before_count = len(self.df)
+            
+            # Remove duplicates (remove all duplicates with keep=False)
             self.df.drop_duplicates(subset=["Standardized_SMILES"], keep=False, inplace=True, ignore_index=True)
+            
+            # Record data count after duplicate removal
+            after_count = len(self.df)
+            if after_count == 0 and before_count > 0:
+                logger.warning(f"All data removed during duplicate removal! Original count: {before_count}")
+                # Try again with keep='first' to prevent complete data removal
+                self.df = pd.DataFrame(compounds).reset_index(drop=True)
+                self.df[self.activity_col] = labels.reset_index(drop=True)
+                self.preprocess_compounds(compounds)
+                self.preprocess_labels(labels)
+                self.df.drop_duplicates(subset=["Standardized_SMILES"], keep='first', inplace=True, ignore_index=True)
+                logger.info(f"Recovered {len(self.df)} records using keep='first' strategy")
+            else:
+                logger.info(f"Removed {before_count - after_count} duplicate records. Remaining: {after_count}")
+            
+        # Add basic columns to ensure they're included
+        for col in [self.activity_col, 'Test', 'Test_Type', 'Test_Subject', 'Measurement_Type']:
+            if col in self.df.columns and col not in self.final_cols:
+                self.final_cols.append(col)
+        
+        # Check if result is empty
+        if len(self.df) == 0:
+            logger.error("Preprocessing resulted in empty dataset!")
+        else:
+            logger.info(f"Preprocessing completed. Final dataset contains {len(self.df)} records.")
+                
         return self.df[self.final_cols]
 
 class DataVisualizer:
@@ -504,7 +678,8 @@ class DataVisualizer:
     def __init__(self, df, smiles_col='Standardized_SMILES', activity_col='Measurement_Value', scale_activity=True):
         self.df = df
         self.smiles_col = smiles_col
-        self.activity_col = f"{activity_col}_scaled" if scale_activity else activity_col
+        self.activity_col = f"{activity_col}_scaled" if scale_activity and f"{activity_col}_scaled" in df.columns else activity_col
+        self.has_chemical_id = 'Chemical ID' in df.columns
     
     def visualize_molecules(self, n_mols=10, output_path=None):
         """
@@ -518,34 +693,144 @@ class DataVisualizer:
             Path to save the output image
         """
         
-        # Generate molecules from SMILES strings
-        mols = []
-        mol_legends = []
+        # Check if we have molecules to visualize
+        if self.smiles_col not in self.df.columns:
+            logger.error(f"SMILES column '{self.smiles_col}' not found in data")
+            return None
+            
+        # Filter valid SMILES - 중복도 처리
+        valid_smiles_df = self.df[self.df[self.smiles_col].notna()].copy()
+        if len(valid_smiles_df) == 0:
+            logger.warning("No valid SMILES found for visualization")
+            return None
+            
+        # 중복된 SMILES가 있을 경우를 처리
+        if len(valid_smiles_df) > len(valid_smiles_df[self.smiles_col].unique()):
+            logger.info(f"Found {len(valid_smiles_df) - len(valid_smiles_df[self.smiles_col].unique())} duplicate SMILES. Keeping first occurrence of each.")
+            # 각 고유 SMILES의 첫 번째 행만 유지
+            valid_smiles_df = valid_smiles_df.drop_duplicates(subset=[self.smiles_col], keep='first')
         
-        for idx, row in self.df.head(n_mols).iterrows():
-            if row[self.smiles_col] and pd.notna(row[self.smiles_col]):
+        # 표시할 분자 수 제한
+        valid_smiles_df = valid_smiles_df.head(n_mols)
+            
+        # Determine grid dimensions
+        n_valid = len(valid_smiles_df)
+        n_cols = min(3, n_valid)  # Maximum 3 molecules per row
+        n_rows = (n_valid + n_cols - 1) // n_cols  # Ceiling division
+        
+        try:
+            # Create a matplotlib figure for custom layout
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*4, n_rows*4))
+            
+            # Handle single subplot case
+            if n_rows * n_cols == 1:
+                axes = np.array([axes])
+            
+            # Flatten axes array for easier iteration
+            axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+            
+            # Iterate through valid molecules
+            for i, (idx, row) in enumerate(valid_smiles_df.iterrows()):
+                if i >= len(axes):
+                    break
+                    
+                # Convert SMILES to molecule
                 mol = Chem.MolFromSmiles(row[self.smiles_col])
-                if mol:
-                    mols.append(mol)
-                    # Add activity value as legend
-                    if pd.notna(row.get(self.activity_col)):
-                        mol_legends.append(f"{row.get(self.activity_col):.2f}")
-                    else:
-                        mol_legends.append("")
-        
-        if not mols:
-            logger.warning("No valid molecules to visualize")
-            return
-        
-        # Create molecule grid and save
-        img = Draw.MolsToGridImage(mols, molsPerRow=min(5, len(mols)), 
-                                  subImgSize=(200, 200), legends=mol_legends)
-        
-        if output_path:
-            img.save(output_path)
-            logger.info(f"Molecule visualization saved to {output_path}")
-        else:
-            return img
+                if mol is None:
+                    logger.warning(f"Failed to convert SMILES to molecule: {row[self.smiles_col]}")
+                    continue
+                
+                # Create molecule image
+                img = Draw.MolToImage(mol, size=(300, 300))
+                
+                # Display molecule in the current axis
+                axes[i].imshow(img)
+                axes[i].axis('off')
+                
+                # Create title with activity value
+                title_parts = []
+                
+                # Add activity value if available
+                if pd.notna(row.get(self.activity_col)):
+                    title_parts.append(f"Activity: {row.get(self.activity_col):.2f}")
+                
+                title_parts.append(f"\n")
+                
+                # Add Chemical ID on a separate line if available
+                if self.has_chemical_id and pd.notna(row.get('Chemical ID')):
+                    title_parts.append(f"ID: {row.get('Chemical ID')}")
+                
+                # Set title with a larger fontsize
+                axes[i].set_title("\n".join(title_parts), fontsize=12)
+            
+            # Hide unused subplots
+            for j in range(min(i+1, len(axes)), len(axes)):
+                axes[j].axis('off')
+                axes[j].set_visible(False)
+            
+            # Adjust layout
+            plt.tight_layout(pad=2.0)
+            
+            # Save or return the figure
+            if output_path:
+                plt.savefig(output_path, dpi=100, bbox_inches='tight')
+                plt.close(fig)
+                logger.info(f"Custom molecule visualization saved to {output_path}")
+                return None
+            else:
+                return fig
+                
+        except Exception as e:
+            logger.error(f"Error creating custom molecule visualization: {e}")
+            
+            # Fallback to original RDKit method if the custom method fails
+            try:
+                # Generate molecules and legends
+                mols = []
+                legends = []
+                
+                for idx, row in valid_smiles_df.iterrows():
+                    try:
+                        mol = Chem.MolFromSmiles(row[self.smiles_col])
+                        if mol:
+                            mols.append(mol)
+                            
+                            # Create two-line legend
+                            legend_parts = []
+                            if pd.notna(row.get(self.activity_col)):
+                                legend_parts.append(f"{row.get(self.activity_col):.2f}")
+                            
+                            if self.has_chemical_id and pd.notna(row.get('Chemical ID')):
+                                if legend_parts:
+                                    legend_parts.append("\n\n\n")
+                                legend_parts.append(f"{row.get('Chemical ID')}")
+                                
+                            legends.append("".join(legend_parts))
+                    except Exception as mol_error:
+                        logger.warning(f"Error processing molecule: {mol_error}")
+                
+                if not mols:
+                    logger.warning("No valid molecules to visualize")
+                    return None
+                    
+                img = Draw.MolsToGridImage(
+                    mols, 
+                    molsPerRow=min(3, len(mols)),
+                    subImgSize=(300, 300),
+                    legends=legends,
+                    maxMols=n_mols
+                )
+                
+                if output_path:
+                    img.save(output_path)
+                    logger.info(f"Fallback molecule visualization saved to {output_path}")
+                    return None
+                else:
+                    return img
+                    
+            except Exception as e2:
+                logger.error(f"Both visualization methods failed: {e2}")
+                return None
     
     def plot_activity_distribution(self, output_path=None):
         """
@@ -864,11 +1149,11 @@ if __name__ == "__main__":
     logger.info(f"Starting processing of {args.input_path}")
     
     try:
-        # CSV 파일 존재 확인
+        # Check if input file exists
         if not os.path.exists(args.input_path):
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
         
-        # 데이터 검사
+        # Inspect data
         inspector = DataInspector(
             input_path=args.input_path,
             smiles_column=args.smiles_col,
@@ -911,10 +1196,30 @@ if __name__ == "__main__":
                 )
                 processed_data = preprocessor.preprocess()
                 
-                base_name = os.path.basename(args.input_path).rstrip('.csv')
-                output_file = f'{args.output_path}/{base_name}_{task}_processed.csv'
+                # Check if result is empty
+                if processed_data.empty:
+                    logger.warning(f"Preprocessing for group {task} resulted in empty dataset. Skipping output.")
+                    continue
+                
+                # Improved file naming logic
+                base_name = os.path.basename(args.input_path).split('.')[0]  # Remove extension
+                
+                # Convert task to string if it's a tuple or list
+                task_str = ""
+                if isinstance(task, (tuple, list)):
+                    # Join tuple/list elements with underscores
+                    task_str = "_".join([str(x).replace(' ', '_') for x in task])
+                else:
+                    # Use as-is for strings, replacing spaces with underscores
+                    task_str = str(task).replace(' ', '_')
+                
+                # Remove invalid characters for filenames
+                task_str = re.sub(r"([^\w\-\.]),", '_', task_str)
+                
+                output_file = f'{args.output_path}/{base_name}_{task_str}_processed.csv'
                 processed_data.to_csv(output_file, index=False)
                 logger.info(f"Saved processed data to {output_file}")
+                logger.info(f"Processed data contains {len(processed_data)} records with {len(processed_data.columns)} columns.")
                 
                 if args.split and not processed_data.empty:
                     splitter = DataSplitter(
@@ -934,7 +1239,7 @@ if __name__ == "__main__":
                     
                     for split_name, split_df in split_data.items():
                         if not split_df.empty:
-                            split_file = f"{split_dir}/{base_name}_{task}_{split_name}.csv"
+                            split_file = f"{split_dir}/{base_name}_{task_str}_{split_name}.csv"
                             split_df.to_csv(split_file, index=False)
                             logger.info(f"Saved {split_name} split to {split_file} ({len(split_df)} samples)")
                 
@@ -951,13 +1256,13 @@ if __name__ == "__main__":
                     )
                     
                     try:
-                        mol_viz_path = f"{viz_dir}/{base_name}_{task}_molecules.png"
+                        mol_viz_path = f"{viz_dir}/{base_name}_{task_str}_molecules.png"
                         visualizer.visualize_molecules(n_mols=10, output_path=mol_viz_path)
                         
-                        act_dist_path = f"{viz_dir}/{base_name}_{task}_activity_dist.png"
+                        act_dist_path = f"{viz_dir}/{base_name}_{task_str}_activity_dist.png"
                         visualizer.plot_activity_distribution(output_path=act_dist_path)
                         
-                        scaffold_path = f"{viz_dir}/{base_name}_{task}_scaffolds.png"
+                        scaffold_path = f"{viz_dir}/{base_name}_{task_str}_scaffolds.png"
                         visualizer.plot_scaffold_diversity(output_path=scaffold_path)
                     except Exception as viz_error:
                         logger.error(f"Error during visualization: {viz_error}")
