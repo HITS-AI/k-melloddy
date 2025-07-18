@@ -12,6 +12,18 @@ This repository will be updated when the K-MELLODDY standard data format is chan
   - Handles binary, categorical, and continuous labels.
   - Converts continuous labels into classification labels using thresholds.
   - Scales experimental values using `StandardScaler`.
+- **Unit Conversion**:
+  - **NEW**: Automatically converts units to SI (International System of Units) using the `pint` package.
+  - Supports common chemical/pharmaceutical units (μg/mL, μM, hours, etc.).
+  - Creates new columns with SI-converted values and units.
+  - Provides detailed conversion summaries and statistics.
+  - Handles comparison operators (>, <) in measurement values.
+- **pH Correction**:
+  - **NEW**: Corrects pH-dependent activity values to a target pH (default: 7.4, physiological pH).
+  - Supports three correction methods: Henderson-Hasselbalch equation, empirical correction, and molecular properties-based correction.
+  - Automatically detects pH-related data when 'pH' is found in Test_Type column.
+  - Creates new columns with pH-corrected values for each method.
+  - Handles missing pH data gracefully.
 - **Input File Support**:
   - Supports both CSV and Excel (.xlsx/.xls) file formats.
   - Automatically detects and processes ADMET and PK sheets in Excel files.
@@ -78,6 +90,10 @@ python hits-preprocess.py --input_path input_data/data_sample.csv --output_path 
 | `--visualize` | Generate visualizations (True/False) |
 | `--parallel` | Use parallel processing for large datasets (True/False) |
 | `--scale_activity` | Scale activity values (True/False) |
+| `--convert_units` | Convert units to SI units (True/False) |
+| `--correct_pH` | Correct pH-dependent activity values (True/False) |
+| `--pH_method` | pH correction method (all, henderson_hasselbalch, empirical, molecular_properties) |
+| `--target_pH` | Target pH for correction (default: 7.4) |
 | `--split` | Data splitting method (random, scaffold, stratified) |
 | `--test_size` | Test set size (default: 0.2) |
 | `--valid_size` | Validation set size (default: 0.1) |
@@ -121,6 +137,8 @@ Optional but recommended columns:
 - **Test_Subject**: Identifies the test subject (e.g., human, rat).
 - **Test_Dose**: Specifies dosage information (automatically included for Pharmacokinetics tests).
 - **Chemical_ID**: Compound identifier (will be included in molecule visualizations if present).
+- **Measurement_Unit**: Unit of measurement (e.g., μg/mL, μM, hours) for unit conversion to SI units.
+- **pH-related columns**: pH value column (e.g., pH, pH_Value, Measurement_pH) for pH correction when Test_Type contains 'pH'.
 
 ### Special Cases Handling
 The pipeline includes special handling for certain data types:
@@ -142,7 +160,13 @@ The pipeline enforces the following training quorum requirements:
 Examines the input data, validates training quorum requirements, and organizes data by test groups.
 
 ### Preprocessor
-Handles chemical standardization, outlier detection, and label preprocessing.
+Handles chemical standardization, outlier detection, label preprocessing, and unit conversion.
+
+### UnitConverter
+Converts measurement units to SI units using the pint package, supporting common chemical/pharmaceutical units.
+
+### pHCorrector
+Corrects pH-dependent activity values using three methods: Henderson-Hasselbalch equation, empirical correction, and molecular properties-based correction.
 
 ### DataVisualizer
 Provides visualization tools for molecular structures, activity distributions, and scaffold diversity.
@@ -160,6 +184,7 @@ Implements data splitting methods for preparing machine learning datasets.
 - `seaborn`
 - `multiprocessing`
 - `openpyxl` (for Excel file support)
+- `pint` (for unit conversion)
   
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
