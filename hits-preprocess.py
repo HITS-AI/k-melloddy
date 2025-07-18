@@ -9,6 +9,13 @@ import seaborn as sns
 import datetime
 import re
 
+# Set pandas display options
+pd.set_option('display.max_rows', None)  # Show all rows
+pd.set_option('display.max_columns', None)  # Show all columns
+pd.set_option('display.width', None)  # Auto-detect display width
+pd.set_option('display.max_colwidth', None)  # Show full content of each column
+pd.set_option('display.expand_frame_repr', False)  # Don't wrap wide frames
+
 from argparse import ArgumentParser
 from typing import Iterable, List, Tuple, Dict, Any, Optional
 from rdkit import Chem
@@ -26,6 +33,15 @@ from functools import partial
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Unit conversion imports
+try:
+    import pint
+    from pint import UnitRegistry
+    PINT_AVAILABLE = True
+except ImportError:
+    PINT_AVAILABLE = False
+    logger.warning("pint package not available. Unit conversion will be disabled.")
 
 # The logger will be configured with file handler in main
 
@@ -83,6 +99,735 @@ class TrainingQuorumError(Exception):
             else:
                 message = "Training quorum requirement not met. At least 50 data points needed"
         super().__init__(message)
+
+
+class UnitConverter:
+    """
+    Class for converting units to SI units using pint package
+    """
+    def __init__(self):
+        if not PINT_AVAILABLE:
+            raise ImportError("pint package is required for unit conversion. Please install it with: pip install pint")
+        
+        self.ureg = UnitRegistry()
+        
+        # Common unit mappings for chemical/pharmaceutical data
+        self.unit_mappings = {
+            # Concentration units
+            'ug/ml': 'ug/mL',
+            'ug/l': 'ug/L', 
+            'mg/ml': 'mg/mL',
+            'mg/l': 'mg/L',
+            'ng/ml': 'ng/mL',
+            'ng/l': 'ng/L',
+            'pg/ml': 'pg/mL',
+            'pg/l': 'pg/L',
+            'um': 'uM',
+            'umol/l': 'uM',
+            'umol/liter': 'uM',
+            'mmol/l': 'mM',
+            'mmol/liter': 'mM',
+            'nmol/l': 'nM',
+            'nmol/liter': 'nM',
+            'pmol/l': 'pM',
+            'pmol/liter': 'pM',
+            'mol/l': 'M',
+            'mol/liter': 'M',
+            
+            # Time units
+            'hr': 'hour',
+            'hrs': 'hour',
+            'hours': 'hour',
+            'min': 'minute',
+            'mins': 'minute',
+            'minutes': 'minute',
+            'sec': 'second',
+            'secs': 'second',
+            'seconds': 'second',
+            'day': 'day',
+            'days': 'day',
+            
+            # Volume units
+            'ml': 'mL',
+            'l': 'L',
+            'ul': 'uL',
+            'nl': 'nL',
+            'pl': 'pL',
+            
+            # Mass units
+            'ug': 'ug',
+            'mg': 'mg',
+            'ng': 'ng',
+            'pg': 'pg',
+            'g': 'g',
+            'kg': 'kg',
+            
+            # Percentage
+            '%': 'percent',
+            'percent': 'percent',
+            
+            # Temperature
+            'c': 'degC',
+            'celsius': 'degC',
+            'f': 'degF',
+            'fahrenheit': 'degF',
+            'k': 'kelvin',
+            'kelvin': 'kelvin',
+            
+            # Pressure
+            'atm': 'atm',
+            'bar': 'bar',
+            'pa': 'Pa',
+            'pascal': 'Pa',
+            'psi': 'psi',
+            
+            # Energy
+            'j': 'J',
+            'joule': 'J',
+            'kj': 'kJ',
+            'kcal': 'kcal',
+            'cal': 'cal',
+            
+            # Length
+            'm': 'm',
+            'cm': 'cm',
+            'mm': 'mm',
+            'um': 'um',
+            'nm': 'nm',
+            'pm': 'pm',
+            'angstrom': 'angstrom',
+            'a': 'angstrom',
+        }
+        
+        # SI unit targets for different measurement types
+        self.si_targets = {
+            'concentration': 'M',  # Molar (mol/L)
+            'time': 's',           # Seconds
+            'volume': 'L',         # Liters
+            'mass': 'g',           # Grams
+            'temperature': 'K',    # Kelvin
+            'pressure': 'Pa',      # Pascal
+            'energy': 'J',         # Joule
+            'length': 'm',         # Meters
+            'percentage': 'dimensionless',  # No unit
+        }
+    
+    def normalize_unit_string(self, unit_str):
+        """
+        Normalize unit string to standard format
+        """
+        if not unit_str or pd.isna(unit_str) or unit_str == "Not specified":
+            return None
+            
+        # Convert to string and clean up
+        unit_str = str(unit_str).strip().lower()
+        
+        # Remove extra spaces and special characters
+        unit_str = re.sub(r'\s+', '', unit_str)
+        unit_str = re.sub(r'[^\w/%]', '', unit_str)
+        
+        # Map to standard format
+        if unit_str in self.unit_mappings:
+            return self.unit_mappings[unit_str]
+        
+        return unit_str
+    
+    def detect_measurement_type(self, unit_str):
+        """
+        Detect the type of measurement based on unit
+        """
+        if not unit_str:
+            return 'unknown'
+            
+        unit_str = str(unit_str).lower()
+        
+        # Concentration indicators
+        if any(x in unit_str for x in ['/ml', '/l', 'm', 'mol']):
+            return 'concentration'
+        
+        # Time indicators
+        if any(x in unit_str for x in ['hr', 'min', 'sec', 'day']):
+            return 'time'
+        
+        # Volume indicators
+        if any(x in unit_str for x in ['ml', 'l', 'ul', 'nl']):
+            return 'volume'
+        
+        # Mass indicators
+        if any(x in unit_str for x in ['g', 'kg', 'mg', 'ug', 'ng']):
+            return 'mass'
+        
+        # Temperature indicators
+        if any(x in unit_str for x in ['c', 'f', 'k', 'celsius', 'fahrenheit', 'kelvin']):
+            return 'temperature'
+        
+        # Pressure indicators
+        if any(x in unit_str for x in ['atm', 'bar', 'pa', 'psi']):
+            return 'pressure'
+        
+        # Energy indicators
+        if any(x in unit_str for x in ['j', 'cal', 'kcal']):
+            return 'energy'
+        
+        # Length indicators
+        if any(x in unit_str for x in ['m', 'cm', 'mm', 'nm', 'angstrom']):
+            return 'length'
+        
+        # Percentage
+        if unit_str in ['%', 'percent']:
+            return 'percentage'
+        
+        return 'unknown'
+    
+    def convert_to_si(self, value, unit_str):
+        """
+        Convert a value with unit to SI units
+        
+        Parameters:
+        -----------
+        value : float
+            The numeric value
+        unit_str : str
+            The unit string
+            
+        Returns:
+        --------
+        tuple : (converted_value, si_unit, original_unit)
+        """
+        if not PINT_AVAILABLE:
+            return value, unit_str, unit_str
+            
+        try:
+            # Normalize unit string
+            normalized_unit = self.normalize_unit_string(unit_str)
+            if not normalized_unit:
+                return value, unit_str, unit_str
+            
+            # Create quantity with pint
+            try:
+                quantity = value * self.ureg(normalized_unit)
+            except:
+                # Try with original unit string
+                try:
+                    quantity = value * self.ureg(unit_str)
+                except:
+                    logger.warning(f"Could not parse unit: {unit_str}. Returning original value.")
+                    return value, unit_str, unit_str
+            
+            # Convert to SI
+            si_quantity = quantity.to_base_units()
+            
+            # Get SI unit string
+            si_unit_str = str(si_quantity.units)
+            
+            return float(si_quantity.magnitude), si_unit_str, unit_str
+            
+        except Exception as e:
+            logger.warning(f"Error converting {value} {unit_str} to SI: {e}")
+            return value, unit_str, unit_str
+    
+    def convert_column_to_si(self, df, value_col, unit_col, new_value_col=None, new_unit_col=None):
+        """
+        Convert a column of values with units to SI units
+        
+        Parameters:
+        -----------
+        df : pandas.DataFrame
+            Input dataframe
+        value_col : str
+            Column name containing numeric values
+        unit_col : str
+            Column name containing unit strings
+        new_value_col : str, optional
+            New column name for converted values (default: value_col + '_si')
+        new_unit_col : str, optional
+            New column name for SI units (default: unit_col + '_si')
+            
+        Returns:
+        --------
+        pandas.DataFrame : DataFrame with converted values
+        """
+        if not PINT_AVAILABLE:
+            logger.warning("pint package not available. Returning original data.")
+            return df
+        
+        if new_value_col is None:
+            new_value_col = f"{value_col}_si"
+        if new_unit_col is None:
+            new_unit_col = f"{unit_col}_si"
+        
+        # Initialize new columns
+        df[new_value_col] = df[value_col].copy()
+        df[new_unit_col] = df[unit_col].copy()
+        
+        # Track conversion statistics
+        converted_count = 0
+        total_count = 0
+        
+        for idx, row in df.iterrows():
+            try:
+                value = row[value_col]
+                unit = row[unit_col]
+                
+                # Skip if value is not numeric or unit is missing
+                if pd.isna(value) or pd.isna(unit) or unit == "Not specified":
+                    continue
+                
+                # Try to convert to numeric if it's a string
+                try:
+                    if isinstance(value, str):
+                        # Remove comparison operators if present
+                        value = re.sub(r'^[<>]\s*', '', value)
+                        value = float(value)
+                except:
+                    continue
+                
+                total_count += 1
+                
+                # Convert to SI
+                converted_value, si_unit, original_unit = self.convert_to_si(value, unit)
+                
+                # Update dataframe
+                df.at[idx, new_value_col] = converted_value
+                df.at[idx, new_unit_col] = si_unit
+                
+                if si_unit != original_unit:
+                    converted_count += 1
+                    
+            except Exception as e:
+                logger.warning(f"Error converting row {idx}: {e}")
+                continue
+        
+        logger.info(f"Unit conversion completed: {converted_count}/{total_count} values converted to SI units")
+        return df
+    
+    def get_conversion_summary(self, df, value_col, unit_col):
+        """
+        Get a summary of unit conversions in the dataframe
+        
+        Parameters:
+        -----------
+        df : pandas.DataFrame
+            Input dataframe
+        value_col : str
+            Column name containing numeric values
+        unit_col : str
+            Column name containing unit strings
+            
+        Returns:
+        --------
+        dict : Summary of unit conversions
+        """
+        if not PINT_AVAILABLE:
+            return {"error": "pint package not available"}
+        
+        unit_counts = df[unit_col].value_counts()
+        measurement_types = {}
+        
+        for unit, count in unit_counts.items():
+            if pd.notna(unit) and unit != "Not specified":
+                measurement_type = self.detect_measurement_type(unit)
+                if measurement_type not in measurement_types:
+                    measurement_types[measurement_type] = {}
+                measurement_types[measurement_type][unit] = count
+        
+        return {
+            "total_records": len(df),
+            "unit_counts": unit_counts.to_dict(),
+            "measurement_types": measurement_types
+        }
+
+
+class pHCorrector:
+    """
+    Class for pH correction of activity values using different methods
+    """
+    def __init__(self, method='all', target_pH=7.4):
+        """
+        Initialize pH corrector
+        
+        Parameters:
+        -----------
+        method : str
+            Correction method: 'all', 'henderson_hasselbalch', 'empirical', 'molecular_properties'
+        target_pH : float
+            Target pH for correction (default: 7.4, physiological pH)
+        """
+        self.method = method
+        self.target_pH = target_pH
+        
+        # Check if RDKit is available for molecular properties method
+        try:
+            from rdkit.Chem import Descriptors
+            self.rdkit_available = True
+        except ImportError:
+            self.rdkit_available = False
+            logger.warning("RDKit not available. Molecular properties method will be disabled.")
+    
+    def _predict_pKa(self, smiles):
+        """
+        Predict pKa values for a molecule
+        
+        Parameters:
+        -----------
+        smiles : str
+            SMILES string of the molecule
+            
+        Returns:
+        --------
+        tuple : (pKa_acidic, pKa_basic) or (None, None) if prediction fails
+        """
+        if not self.rdkit_available:
+            return None, None
+            
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None, None
+            
+            # Simple pKa estimation based on molecular properties
+            # This is a simplified approach - in practice, more sophisticated models would be used
+            
+            # Count acidic and basic groups
+            acidic_groups = 0
+            basic_groups = 0
+            
+            for atom in mol.GetAtoms():
+                # Carboxylic acids (typical pKa ~4-5)
+                if atom.GetSymbol() == 'O' and atom.GetDegree() == 1:
+                    for bond in atom.GetBonds():
+                        if bond.GetOtherAtom(atom).GetSymbol() == 'C':
+                            acidic_groups += 1
+                
+                # Amines (typical pKa ~9-10)
+                if atom.GetSymbol() == 'N' and atom.GetDegree() <= 3:
+                    basic_groups += 1
+            
+            # Estimate pKa values (simplified)
+            pKa_acidic = 4.5 if acidic_groups > 0 else None
+            pKa_basic = 9.5 if basic_groups > 0 else None
+            
+            return pKa_acidic, pKa_basic
+            
+        except Exception as e:
+            logger.warning(f"Error predicting pKa for {smiles}: {e}")
+            return None, None
+    
+    def _henderson_hasselbalch_correction(self, activity_value, pH_measured, pKa_acidic=None, pKa_basic=None):
+        """
+        Correct activity using Henderson-Hasselbalch equation
+        
+        Parameters:
+        -----------
+        activity_value : float
+            Measured activity value
+        pH_measured : float
+            pH at which activity was measured
+        pKa_acidic : float, optional
+            Acidic pKa of the compound
+        pKa_basic : float, optional
+            Basic pKa of the compound
+            
+        Returns:
+        --------
+        float : Corrected activity value
+        """
+        if pH_measured == self.target_pH:
+            return activity_value
+        
+        # Determine if compound is primarily acidic or basic
+        is_acidic = False
+        pKa = None
+        
+        if pKa_acidic is not None and pKa_basic is not None:
+            # Use the pKa closer to physiological pH
+            if abs(pKa_acidic - 7.4) < abs(pKa_basic - 7.4):
+                pKa = pKa_acidic
+                is_acidic = True
+            else:
+                pKa = pKa_basic
+                is_acidic = False
+        elif pKa_acidic is not None:
+            pKa = pKa_acidic
+            is_acidic = True
+        elif pKa_basic is not None:
+            pKa = pKa_basic
+            is_acidic = False
+        else:
+            # No pKa available, return original value
+            return activity_value
+        
+        try:
+            # Calculate ionization fractions
+            if is_acidic:
+                # Acidic drug: HA ↔ H+ + A-
+                f_ionized_measured = 1 / (1 + 10**(pKa - pH_measured))
+                f_ionized_target = 1 / (1 + 10**(pKa - self.target_pH))
+            else:
+                # Basic drug: B + H+ ↔ BH+
+                f_ionized_measured = 1 / (1 + 10**(pH_measured - pKa))
+                f_ionized_target = 1 / (1 + 10**(self.target_pH - pKa))
+            
+            # Unionized fractions
+            f_unionized_measured = 1 - f_ionized_measured
+            f_unionized_target = 1 - f_ionized_target
+            
+            # Avoid division by zero
+            if f_unionized_measured == 0:
+                return activity_value
+            
+            # Correction factor
+            correction_factor = f_unionized_target / f_unionized_measured
+            
+            # Corrected activity value
+            corrected_activity = activity_value * correction_factor
+            
+            return corrected_activity
+            
+        except Exception as e:
+            logger.warning(f"Error in Henderson-Hasselbalch correction: {e}")
+            return activity_value
+    
+    def _empirical_correction(self, activity_value, pH_measured):
+        """
+        Correct activity using empirical pH-activity relationship
+        
+        Parameters:
+        -----------
+        activity_value : float
+            Measured activity value
+        pH_measured : float
+            pH at which activity was measured
+            
+        Returns:
+        --------
+        float : Corrected activity value
+        """
+        if pH_measured == self.target_pH:
+            return activity_value
+        
+        try:
+            # Simple empirical correction based on pH difference
+            # This is a simplified approach - in practice, more sophisticated models would be used
+            
+            pH_diff = self.target_pH - pH_measured
+            
+            # Empirical correction factor based on pH difference
+            # Values are estimated based on typical pH effects on drug activity
+            if abs(pH_diff) <= 1.0:
+                # Small pH difference: minimal correction
+                correction_factor = 1.0 + (pH_diff * 0.05)
+            elif abs(pH_diff) <= 2.0:
+                # Medium pH difference: moderate correction
+                correction_factor = 1.0 + (pH_diff * 0.1)
+            else:
+                # Large pH difference: significant correction
+                correction_factor = 1.0 + (pH_diff * 0.15)
+            
+            # Limit correction factor to reasonable range
+            correction_factor = max(0.1, min(10.0, correction_factor))
+            
+            corrected_activity = activity_value * correction_factor
+            
+            return corrected_activity
+            
+        except Exception as e:
+            logger.warning(f"Error in empirical correction: {e}")
+            return activity_value
+    
+    def _molecular_properties_correction(self, activity_value, pH_measured, smiles):
+        """
+        Correct activity using molecular properties
+        
+        Parameters:
+        -----------
+        activity_value : float
+            Measured activity value
+        pH_measured : float
+            pH at which activity was measured
+        smiles : str
+            SMILES string of the molecule
+            
+        Returns:
+        --------
+        float : Corrected activity value
+        """
+        if not self.rdkit_available or pH_measured == self.target_pH:
+            return activity_value
+        
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return activity_value
+            
+            # Calculate molecular properties
+            mol_weight = Descriptors.ExactMolWt(mol)
+            logp = Descriptors.MolLogP(mol)
+            tpsa = Descriptors.TPSA(mol)
+            hbd = Descriptors.NumHDonors(mol)
+            hba = Descriptors.NumHAcceptors(mol)
+            
+            # Calculate pH sensitivity score based on molecular properties
+            # Higher logP: more lipophilic, less pH sensitive
+            # Higher TPSA: more polar, more pH sensitive
+            # More HBD/HBA: more pH sensitive
+            
+            logp_factor = max(0.5, min(2.0, 1.0 - (logp / 10.0)))  # LogP effect
+            tpsa_factor = max(0.5, min(2.0, 1.0 + (tpsa / 200.0)))  # TPSA effect
+            hbd_hba_factor = max(0.5, min(2.0, 1.0 + ((hbd + hba) / 20.0)))  # HBD/HBA effect
+            
+            # Combined pH sensitivity
+            pH_sensitivity = (logp_factor + tpsa_factor + hbd_hba_factor) / 3.0
+            
+            # Calculate correction based on pH difference and sensitivity
+            pH_diff = self.target_pH - pH_measured
+            correction_factor = 1.0 + (pH_diff * 0.1 * pH_sensitivity)
+            
+            # Limit correction factor
+            correction_factor = max(0.1, min(10.0, correction_factor))
+            
+            corrected_activity = activity_value * correction_factor
+            
+            return corrected_activity
+            
+        except Exception as e:
+            logger.warning(f"Error in molecular properties correction: {e}")
+            return activity_value
+    
+    def correct_activity(self, activity_value, pH_measured, smiles=None):
+        """
+        Correct activity value using the specified method
+        
+        Parameters:
+        -----------
+        activity_value : float
+            Measured activity value
+        pH_measured : float
+            pH at which activity was measured
+        smiles : str, optional
+            SMILES string of the molecule (required for molecular properties method)
+            
+        Returns:
+        --------
+        dict : Dictionary with corrected values for each method
+        """
+        if pd.isna(activity_value) or pd.isna(pH_measured):
+            return {
+                'original': activity_value,
+                'henderson_hasselbalch': activity_value,
+                'empirical': activity_value,
+                'molecular_properties': activity_value
+            }
+        
+        try:
+            activity_value = float(activity_value)
+            pH_measured = float(pH_measured)
+        except (ValueError, TypeError):
+            return {
+                'original': activity_value,
+                'henderson_hasselbalch': activity_value,
+                'empirical': activity_value,
+                'molecular_properties': activity_value
+            }
+        
+        result = {'original': activity_value}
+        
+        # Henderson-Hasselbalch correction
+        if self.method in ['all', 'henderson_hasselbalch']:
+            pKa_acidic, pKa_basic = self._predict_pKa(smiles) if smiles else (None, None)
+            result['henderson_hasselbalch'] = self._henderson_hasselbalch_correction(
+                activity_value, pH_measured, pKa_acidic, pKa_basic
+            )
+        
+        # Empirical correction
+        if self.method in ['all', 'empirical']:
+            result['empirical'] = self._empirical_correction(activity_value, pH_measured)
+        
+        # Molecular properties correction
+        if self.method in ['all', 'molecular_properties']:
+            result['molecular_properties'] = self._molecular_properties_correction(
+                activity_value, pH_measured, smiles
+            )
+        
+        return result
+    
+    def correct_column(self, df, activity_col, pH_col, smiles_col=None):
+        """
+        Correct activity values in a DataFrame column
+        
+        Parameters:
+        -----------
+        df : pandas.DataFrame
+            Input dataframe
+        activity_col : str
+            Column name containing activity values
+        pH_col : str
+            Column name containing pH values
+        smiles_col : str, optional
+            Column name containing SMILES strings
+            
+        Returns:
+        --------
+        pandas.DataFrame : DataFrame with corrected values
+        """
+        if activity_col not in df.columns or pH_col not in df.columns:
+            logger.warning(f"Required columns not found: {activity_col}, {pH_col}")
+            return df
+        
+        # Create new columns for corrected values
+        if self.method == 'all':
+            new_cols = [
+                f"{activity_col}_pH_corrected_hh",
+                f"{activity_col}_pH_corrected_emp",
+                f"{activity_col}_pH_corrected_mp"
+            ]
+        else:
+            method_suffix = {
+                'henderson_hasselbalch': 'hh',
+                'empirical': 'emp',
+                'molecular_properties': 'mp'
+            }
+            new_cols = [f"{activity_col}_pH_corrected_{method_suffix[self.method]}"]
+        
+        # Initialize new columns
+        for col in new_cols:
+            df[col] = df[activity_col].copy()
+        
+        corrected_count = 0
+        total_count = 0
+        
+        for idx, row in df.iterrows():
+            try:
+                activity = row[activity_col]
+                pH = row[pH_col]
+                smiles = row[smiles_col] if smiles_col else None
+                
+                if pd.isna(activity) or pd.isna(pH):
+                    continue
+                
+                total_count += 1
+                
+                # Perform correction
+                corrected = self.correct_activity(activity, pH, smiles)
+                
+                # Update dataframe
+                if self.method == 'all':
+                    df.at[idx, f"{activity_col}_pH_corrected_hh"] = corrected['henderson_hasselbalch']
+                    df.at[idx, f"{activity_col}_pH_corrected_emp"] = corrected['empirical']
+                    df.at[idx, f"{activity_col}_pH_corrected_mp"] = corrected['molecular_properties']
+                else:
+                    method_key = self.method
+                    df.at[idx, new_cols[0]] = corrected[method_key]
+                
+                if corrected['original'] != corrected.get('henderson_hasselbalch', corrected['original']):
+                    corrected_count += 1
+                    
+            except Exception as e:
+                logger.warning(f"Error correcting row {idx}: {e}")
+                continue
+        
+        logger.info(f"pH correction completed: {corrected_count}/{total_count} values corrected using {self.method} method")
+        return df
 
 
 class DataInspector:
@@ -275,6 +1020,10 @@ class Preprocessor:
                  keep_duplicates:bool=False,
                  detect_outliers:bool=False,
                  scale_activity:bool=True,
+                 convert_units:bool=True,
+                 correct_pH:bool=True,
+                 pH_method:str='all',
+                 target_pH:float=7.4,
                  threshold=None):
         # Load input data
         self.df = df
@@ -290,12 +1039,37 @@ class Preprocessor:
         self.keep_duplicates = keep_duplicates
         self.scale_activity = scale_activity
         self.detect_outliers = detect_outliers
+        self.convert_units = convert_units
+        self.correct_pH = correct_pH
+        self.pH_method = pH_method
+        self.target_pH = target_pH
         self.active_is_high:bool = True
         self.final_cols = []
         self.smiles_column = smiles_column
         self.remover = SaltRemover.SaltRemover()
         self.uncharger = MolStandardize.rdMolStandardize.Uncharger()
         self.enumerator = MolStandardize.rdMolStandardize.TautomerEnumerator()
+        
+        # Initialize unit converter if needed
+        if self.convert_units and PINT_AVAILABLE:
+            try:
+                self.unit_converter = UnitConverter()
+                logger.info("Unit converter initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize unit converter: {e}")
+                self.convert_units = False
+        elif self.convert_units and not PINT_AVAILABLE:
+            logger.warning("pint package not available. Unit conversion disabled.")
+            self.convert_units = False
+        
+        # Initialize pH corrector if needed
+        if self.correct_pH:
+            try:
+                self.pH_corrector = pHCorrector(method=self.pH_method, target_pH=self.target_pH)
+                logger.info(f"pH corrector initialized successfully with method: {self.pH_method}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize pH corrector: {e}")
+                self.correct_pH = False
         
         # Add Test_Dose to final columns for Pharmacokinetics tests
         if 'Test' in self.df.columns and 'Pharmacokinetics' in self.df['Test'].values:
@@ -623,6 +1397,99 @@ class Preprocessor:
     def preprocess(self):
         compounds = self.df[self.smiles_col]
         labels = self.df[self.activity_col]
+        
+        # Perform unit conversion if enabled and unit column exists
+        if self.convert_units and 'Measurement_Unit' in self.df.columns:
+            logger.info("Starting unit conversion to SI units...")
+            try:
+                # Get conversion summary before conversion
+                summary = self.unit_converter.get_conversion_summary(self.df, self.activity_col, 'Measurement_Unit')
+                logger.info(f"Unit conversion summary: {summary}")
+                
+                # Perform unit conversion
+                self.df = self.unit_converter.convert_column_to_si(
+                    self.df, 
+                    self.activity_col, 
+                    'Measurement_Unit',
+                    f"{self.activity_col}_si",
+                    'Measurement_Unit_si'
+                )
+                
+                # Add converted columns to final columns
+                if f"{self.activity_col}_si" in self.df.columns:
+                    self.final_cols.append(f"{self.activity_col}_si")
+                if 'Measurement_Unit_si' in self.df.columns:
+                    self.final_cols.append('Measurement_Unit_si')
+                
+                logger.info("Unit conversion completed successfully")
+                
+            except Exception as e:
+                logger.error(f"Error during unit conversion: {e}")
+                logger.info("Continuing without unit conversion")
+        
+        # Perform pH correction if enabled and pH-related data exists
+        if self.correct_pH and 'Test_Type' in self.df.columns:
+            # Check if any Test_Type contains 'pH'
+            pH_data_mask = self.df['Test_Type'].astype(str).str.contains('pH', case=False, na=False)
+            
+            if pH_data_mask.any():
+                logger.info("pH-related data detected. Starting pH correction...")
+                try:
+                    # Find pH column (could be named differently)
+                    pH_col = None
+                    possible_pH_cols = ['pH', 'pH_Value', 'Measurement_pH', 'Test_pH']
+                    for col in possible_pH_cols:
+                        if col in self.df.columns:
+                            pH_col = col
+                            break
+                    
+                    if pH_col is None:
+                        logger.warning("pH column not found. pH correction will be skipped.")
+                    else:
+                        logger.info(f"Using pH column: {pH_col}")
+                        
+                        # Perform pH correction only on pH-related data
+                        pH_df = self.df[pH_data_mask].copy()
+                        corrected_pH_df = self.pH_corrector.correct_column(
+                            pH_df, 
+                            self.activity_col, 
+                            pH_col, 
+                            self.smiles_col
+                        )
+                        
+                        # Update the original dataframe with corrected values
+                        for idx in corrected_pH_df.index:
+                            for col in corrected_pH_df.columns:
+                                if col.startswith(f"{self.activity_col}_pH_corrected"):
+                                    self.df.at[idx, col] = corrected_pH_df.at[idx, col]
+                        
+                        # Add pH corrected columns to final columns
+                        if self.pH_method == 'all':
+                            pH_corrected_cols = [
+                                f"{self.activity_col}_pH_corrected_hh",
+                                f"{self.activity_col}_pH_corrected_emp",
+                                f"{self.activity_col}_pH_corrected_mp"
+                            ]
+                        else:
+                            method_suffix = {
+                                'henderson_hasselbalch': 'hh',
+                                'empirical': 'emp',
+                                'molecular_properties': 'mp'
+                            }
+                            pH_corrected_cols = [f"{self.activity_col}_pH_corrected_{method_suffix[self.pH_method]}"]
+                        
+                        for col in pH_corrected_cols:
+                            if col in self.df.columns:
+                                self.final_cols.append(col)
+                        
+                        logger.info(f"pH correction completed successfully for {pH_data_mask.sum()} records")
+                        
+                except Exception as e:
+                    logger.error(f"Error during pH correction: {e}")
+                    logger.info("Continuing without pH correction")
+            else:
+                logger.info("No pH-related data found. pH correction skipped.")
+        
         self.preprocess_compounds(compounds)
         self.preprocess_labels(labels)
         if self.detect_outliers:
@@ -1084,6 +1951,11 @@ class DataSplitter:
         else:  # random
             return self.random_split(test_size, valid_size)
 
+
+std2gist = {
+    ""
+}
+
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--input_path", type=str, required=True)
@@ -1091,6 +1963,11 @@ if __name__ == "__main__":
     parser.add_argument("--visualize", type=bool, default=False, help="Generate visualizations")
     parser.add_argument("--parallel", type=bool, default=False, help="Use parallel processing")
     parser.add_argument("--scale_activity", type=bool, default=True, help="Scale activity values")
+    parser.add_argument("--convert_units", type=bool, default=True, help="Convert units to SI units")
+    parser.add_argument("--correct_pH", type=bool, default=False, help="Correct pH-dependent activity values")
+    parser.add_argument("--pH_method", choices=["all", "henderson_hasselbalch", "empirical", "molecular_properties"], 
+                      default="all", help="pH correction method")
+    parser.add_argument("--target_pH", type=float, default=7.4, help="Target pH for correction (default: 7.4)")
     parser.add_argument("--split", choices=["random", "scaffold", "stratified"], 
                       help="Split data for machine learning")
     parser.add_argument("--test_size", type=float, default=0.2, help="Test set size")
@@ -1153,6 +2030,15 @@ if __name__ == "__main__":
         if not os.path.exists(args.input_path):
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
         
+        # Create output directory at the very beginning
+        logger.info(f"Attempting to create output directory: {args.output_path}")
+        try:
+            os.makedirs(args.output_path, exist_ok=True)
+            logger.info(f"Successfully created/verified output directory: {args.output_path}")
+        except Exception as dir_error:
+            logger.error(f"Failed to create output directory: {dir_error}")
+            raise
+        
         # Inspect data
         inspector = DataInspector(
             input_path=args.input_path,
@@ -1176,7 +2062,7 @@ if __name__ == "__main__":
         logger.info("-"*50)
         
         if not os.path.exists(args.output_path):
-            os.makedirs(args.output_path)
+            os.makedirs(args.output_path, exist_ok=True)
             logger.info(f"Created output directory: {args.output_path}")
         
         for i, each_group in enumerate(valid_groups):
@@ -1192,7 +2078,11 @@ if __name__ == "__main__":
                     task,
                     smiles_column=args.smiles_col,
                     activity_column=args.activity_col,
-                    scale_activity=args.scale_activity
+                    scale_activity=args.scale_activity,
+                    convert_units=args.convert_units,
+                    correct_pH=args.correct_pH,
+                    pH_method=args.pH_method,
+                    target_pH=args.target_pH
                 )
                 processed_data = preprocessor.preprocess()
                 
@@ -1216,10 +2106,19 @@ if __name__ == "__main__":
                 # Remove invalid characters for filenames
                 task_str = re.sub(r"([^\w\-\.]),", '_', task_str)
                 
-                output_file = f'{args.output_path}/{base_name}_{task_str}_processed.csv'
-                processed_data.to_csv(output_file, index=False)
-                logger.info(f"Saved processed data to {output_file}")
-                logger.info(f"Processed data contains {len(processed_data)} records with {len(processed_data.columns)} columns.")
+                # Verify output directory exists before saving
+                if not os.path.exists(args.output_path):
+                    logger.error(f"Output directory does not exist: {args.output_path}")
+                    raise FileNotFoundError(f"Output directory does not exist: {args.output_path}")
+                
+                output_file = os.path.join(args.output_path, f'{base_name}_{task_str}_processed.csv')
+                logger.info(f"Attempting to save file to: {output_file}")
+                try:
+                    processed_data.to_csv(output_file, index=False)
+                    logger.info(f"Successfully saved processed data to {output_file}")
+                except Exception as save_error:
+                    logger.error(f"Failed to save file {output_file}: {save_error}")
+                    raise
                 
                 if args.split and not processed_data.empty:
                     splitter = DataSplitter(
@@ -1233,20 +2132,20 @@ if __name__ == "__main__":
                         valid_size=args.valid_size
                     )
                     
-                    split_dir = f"{args.output_path}/splits"
-                    if not os.path.exists(split_dir):
-                        os.makedirs(split_dir)
+                    split_dir = os.path.join(args.output_path, "splits")
+                    os.makedirs(split_dir, exist_ok=True)
+                    logger.info(f"Created splits directory: {split_dir}")
                     
                     for split_name, split_df in split_data.items():
                         if not split_df.empty:
-                            split_file = f"{split_dir}/{base_name}_{task_str}_{split_name}.csv"
+                            split_file = os.path.join(split_dir, f"{base_name}_{task_str}_{split_name}.csv")
                             split_df.to_csv(split_file, index=False)
                             logger.info(f"Saved {split_name} split to {split_file} ({len(split_df)} samples)")
                 
                 if args.visualize and not processed_data.empty:
-                    viz_dir = f"{args.output_path}/visualizations"
-                    if not os.path.exists(viz_dir):
-                        os.makedirs(viz_dir)
+                    viz_dir = os.path.join(args.output_path, "visualizations")
+                    os.makedirs(viz_dir, exist_ok=True)
+                    logger.info(f"Created visualizations directory: {viz_dir}")
                     
                     visualizer = DataVisualizer(
                         processed_data, 
@@ -1256,13 +2155,13 @@ if __name__ == "__main__":
                     )
                     
                     try:
-                        mol_viz_path = f"{viz_dir}/{base_name}_{task_str}_molecules.png"
+                        mol_viz_path = os.path.join(viz_dir, f"{base_name}_{task_str}_molecules.png")
                         visualizer.visualize_molecules(n_mols=10, output_path=mol_viz_path)
                         
-                        act_dist_path = f"{viz_dir}/{base_name}_{task_str}_activity_dist.png"
+                        act_dist_path = os.path.join(viz_dir, f"{base_name}_{task_str}_activity_dist.png")
                         visualizer.plot_activity_distribution(output_path=act_dist_path)
                         
-                        scaffold_path = f"{viz_dir}/{base_name}_{task_str}_scaffolds.png"
+                        scaffold_path = os.path.join(viz_dir, f"{base_name}_{task_str}_scaffolds.png")
                         visualizer.plot_scaffold_diversity(output_path=scaffold_path)
                     except Exception as viz_error:
                         logger.error(f"Error during visualization: {viz_error}")
