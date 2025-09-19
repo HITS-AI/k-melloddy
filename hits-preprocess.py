@@ -847,12 +847,19 @@ class DataInspector:
         Normalize column names to handle both old and new K-MELLODDY formats.
         Maps new format column names to old format for compatibility.
         """
+        # Remove the original Measurement_Value column that contains [Value] placeholders
+        if 'Measurement_Value' in df.columns:
+            df = df.drop(columns=['Measurement_Value'])
+        
         column_mapping = {
             # Handle Test_Subject variations
             'Test_Subject*': 'Test_Subject',
             
             # Handle Measurement vs Measurment typos (only for old format)
             # Note: New format uses correct spelling 'Measurement_*'
+            
+            # Map the actual data column in new format
+            'Unnamed: 10': 'Measurement_Value',  # This contains the actual measurement values
             
             # Handle new columns that don't exist in old format
             'Measurement_Conc': 'Measurement_Conc',  # Keep as is for new features
@@ -863,7 +870,7 @@ class DataInspector:
         # Apply column mapping
         df = df.rename(columns=column_mapping)
         
-        # Remove any unnamed columns that might cause issues
+        # Remove any unnamed columns that might cause issues (except the one we mapped)
         df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
         
         logger.info(f"Normalized column names. Final columns: {df.columns.tolist()}")
