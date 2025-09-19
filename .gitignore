@@ -166,3 +166,9 @@ cython_debug/
 # Forum sample directory
 forum_sample/
 forum_sample/**/*
+
+# New K-MELLODDY data files (exclude from version control)
+input_data/Des_43404_PAMPA_Caco-2_MDCK_250829.xlsx
+processed_data/Des_43404_PAMPA_Caco-2_MDCK_250829_*
+processed_data/visualizations/Des_43404_PAMPA_Caco-2_MDCK_250829_*
+processed_data/splits/Des_43404_PAMPA_Caco-2_MDCK_250829_*
