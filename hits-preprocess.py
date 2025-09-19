@@ -830,6 +830,57 @@ class pHCorrector:
         return df
 
 
+def process_smiles_batch_global(smiles_batch):
+    """
+    Global function for processing SMILES batches in parallel.
+    This function is defined at module level to avoid pickle issues with multiprocessing.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import MolStandardize
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+    
+    # Initialize RDKit objects locally to avoid pickle issues
+    # Use the same approach as the main class
+    uncharger = MolStandardize.rdMolStandardize.Uncharger()
+    enumerator = MolStandardize.rdMolStandardize.TautomerEnumerator()
+    
+    results = []
+    for smiles in smiles_batch:
+        try:
+            # Standardize SMILES using the same approach as preprocess_compound
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                raise ValueError(f"SMILES string is not valid: {smiles}")
+
+            # Remove isotope
+            for atom in mol.GetAtoms():
+                atom.SetIsotope(0)
+
+            mol = uncharger.uncharge(mol)                  # Uncharge
+            Chem.SetAromaticity(mol)                        # Aromaticity
+            mol = Chem.RemoveHs(mol)                        # Remove H
+
+            # Stereochemistry (keep stereo by default)
+            Chem.AssignStereochemistry(mol, force=True, cleanIt=True)
+            
+            mol = enumerator.Canonicalize(mol)             # Tautomer
+            
+            try:
+                Chem.SanitizeMol(mol)                       # Check valence error
+            except Chem.rdChem.KekulizeException:
+                raise ValueError(f"Valence error detected in molecule: {smiles}")
+            
+            standardized_smiles = Chem.MolToSmiles(mol, canonical=True)
+            scaffold = MurckoScaffold.GetScaffoldForMol(mol)    # Scaffold extraction
+            scaffold_smiles = Chem.MolToSmiles(scaffold, canonical=True)
+            
+            results.append((standardized_smiles, scaffold_smiles))
+        except Exception as e:
+            logger.warning(f"Error processing SMILES {smiles}: {e}")
+            results.append((None, None))
+    return results
+
+
 class DataInspector:
     def __init__(self,
                  input_path:str,
@@ -1281,23 +1332,12 @@ class Preprocessor:
             logger.info(f"Processing compounds in parallel with {multiprocessing.cpu_count()} cores.")
             smiles_list = list(smiles_list)  # Ensure it's a list
             
-            def process_smiles_batch(smiles_batch):
-                results = []
-                for smiles in smiles_batch:
-                    try:
-                        std_smiles, scaffold = self.preprocess_compound(smiles)
-                        results.append((std_smiles, scaffold))
-                    except ValueError as e:
-                        logger.warning(f"Error processing SMILES {smiles}: {e}")
-                        results.append((None, None))
-                return results
-                
             batch_size = max(100, len(smiles_list) // (multiprocessing.cpu_count() * 2))
             smiles_batches = [smiles_list[i:i+batch_size] for i in range(0, len(smiles_list), batch_size)]
 
             start_time = time.time()
             with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-                results = pool.map(process_smiles_batch, smiles_batches)
+                results = pool.map(process_smiles_batch_global, smiles_batches)
 
             flat_results = [item for sublist in results for item in sublist]
             standardized_smiles_list = [item[0] for item in flat_results]
