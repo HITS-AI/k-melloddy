@@ -27,7 +27,9 @@ This repository will be updated when the K-MELLODDY standard data format is chan
 - **Input File Support**:
   - Supports both CSV and Excel (.xlsx/.xls) file formats.
   - Automatically detects and processes ADMET and PK sheets in Excel files.
+  - **NEW**: Supports new K-MELLODDY format with '데이터' sheet (header at row 2).
   - Combines data from multiple sheets for comprehensive analysis.
+  - **NEW**: Automatic column name normalization for backward compatibility.
 - **Flexible Data Handling**:
   - Automatically includes Test_Dose column for Pharmacokinetics test types.
   - Groups data by Test, Test_Type, Test_Subject, and Measurement_Type for more precise analysis.
@@ -126,6 +128,7 @@ The pipeline supports two main file formats:
 
 #### Excel Files (.xlsx/.xls)
 - Automatically processes 'ADMET' and 'PK' sheets if available.
+- **NEW**: Supports new K-MELLODDY format with '데이터' sheet (header at row 2).
 - Combines data from both sheets for comprehensive analysis.
 - Falls back to the first sheet if specific named sheets aren't found.
 
@@ -134,11 +137,16 @@ Required columns in both formats:
 - **Activity Column**: Contains numeric or categorical activity values (default: `Measurement_Value`).
 
 Optional but recommended columns:
-- **Test_Subject**: Identifies the test subject (e.g., human, rat).
+- **Test_Subject**: Identifies the test subject (e.g., human, rat). In new format, this may be labeled as 'Test_Subject*'.
 - **Test_Dose**: Specifies dosage information (automatically included for Pharmacokinetics tests).
 - **Chemical_ID**: Compound identifier (will be included in molecule visualizations if present).
 - **Measurement_Unit**: Unit of measurement (e.g., μg/mL, μM, hours) for unit conversion to SI units.
 - **pH-related columns**: pH value column (e.g., pH, pH_Value, Measurement_pH) for pH correction when Test_Type contains 'pH'.
+
+**NEW**: Additional columns in new K-MELLODDY format:
+- **Measurement_Conc**: Concentration information for measurements.
+- **Measurement_Temp**: Temperature information for measurements.
+- **Measurement_Class**: Classification information for measurements.
 
 ### Special Cases Handling
 The pipeline includes special handling for certain data types:

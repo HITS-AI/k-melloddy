@@ -835,12 +835,39 @@ class DataInspector:
                  input_path:str,
                  smiles_column:str='SMILES_Structure_Parent',
                  activity_column:str='Measurement_Value',
-                 condition_columns:list=['Test', 'Test_Type', 'Test_Subject', 'Measurement_Type']
+                 condition_columns:list=['Test', 'Test_Type', 'Test_Subject', 'Measurment_Type', 'Measurement_Conc', 'Measurement_Temp', 'Measurement_Class']
                  ):
         self.smiles_col = smiles_column
         self.activity_col = activity_column
         self.condition_columns = condition_columns
         self.df = self.load_data(input_path)
+    
+    def normalize_column_names(self, df):
+        """
+        Normalize column names to handle both old and new K-MELLODDY formats.
+        Maps new format column names to old format for compatibility.
+        """
+        column_mapping = {
+            # Handle Test_Subject variations
+            'Test_Subject*': 'Test_Subject',
+            
+            # Handle Measurement vs Measurment typos (only for old format)
+            # Note: New format uses correct spelling 'Measurement_*'
+            
+            # Handle new columns that don't exist in old format
+            'Measurement_Conc': 'Measurement_Conc',  # Keep as is for new features
+            'Measurement_Temp': 'Measurement_Temp',  # Keep as is for new features
+            'Measurement_Class': 'Measurement_Class',  # Keep as is for new features
+        }
+        
+        # Apply column mapping
+        df = df.rename(columns=column_mapping)
+        
+        # Remove any unnamed columns that might cause issues
+        df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+        
+        logger.info(f"Normalized column names. Final columns: {df.columns.tolist()}")
+        return df
     
     def load_data(self, input_path):
         # Check if file exists
@@ -869,10 +896,16 @@ class DataInspector:
                 logger.info("Reading PK sheet")
                 pk_df = pd.read_excel(excel_file, sheet_name='PK').fillna("Not specified")
                 dfs.append(pk_df)
+            
+            # Check for new K-MELLODDY format with '데이터' sheet
+            if '데이터' in sheets:
+                logger.info("Reading 데이터 sheet (new K-MELLODDY format)")
+                data_df = pd.read_excel(excel_file, sheet_name='데이터', header=1).fillna("Not specified")
+                dfs.append(data_df)
                 
             if not dfs:
                 # If no specific sheets found, read the first sheet
-                logger.warning(f"No ADMET or PK sheets found in {input_path}. Reading first sheet.")
+                logger.warning(f"No ADMET, PK, or 데이터 sheets found in {input_path}. Reading first sheet.")
                 df = pd.read_excel(excel_file, sheet_name=0).fillna("Not specified")
             else:
                 # Combine all sheets
@@ -908,6 +941,9 @@ class DataInspector:
                 # Replace other potentially problematic unicode characters
                 df[col] = df[col].apply(lambda x: self._replace_special_chars(x) if isinstance(x, str) else x)
                 
+        # Normalize column names to handle both old and new formats
+        df = self.normalize_column_names(df)
+        
         # Ensure all condition columns exist
         for col in self.condition_columns:
             if col not in df.columns:
