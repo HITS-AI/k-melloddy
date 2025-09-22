@@ -17,6 +17,8 @@ pd.set_option('display.max_colwidth', None)  # Show full content of each column
 pd.set_option('display.expand_frame_repr', False)  # Don't wrap wide frames
 
 from argparse import ArgumentParser
+import sys
+import json
 from typing import Iterable, List, Tuple, Dict, Any, Optional
 from rdkit import Chem
 from rdkit.Chem import SaltRemover, MolStandardize, Draw
@@ -955,15 +957,15 @@ class DataInspector:
                 pk_df = pd.read_excel(excel_file, sheet_name='PK').fillna("Not specified")
                 dfs.append(pk_df)
             
-            # Check for new K-MELLODDY format with '데이터' sheet
+            # Check for new K-MELLODDY format with 'Data' sheet
             if '데이터' in sheets:
-                logger.info("Reading 데이터 sheet (new K-MELLODDY format)")
+                logger.info("Reading Data sheet (new K-MELLODDY format)")
                 data_df = pd.read_excel(excel_file, sheet_name='데이터', header=1).fillna("Not specified")
                 dfs.append(data_df)
                 
             if not dfs:
                 # If no specific sheets found, read the first sheet
-                logger.warning(f"No ADMET, PK, or 데이터 sheets found in {input_path}. Reading first sheet.")
+                logger.warning(f"No ADMET, PK, or Data sheets found in {input_path}. Reading first sheet.")
                 df = pd.read_excel(excel_file, sheet_name=0).fillna("Not specified")
             else:
                 # Combine all sheets
@@ -1648,19 +1650,19 @@ class DataVisualizer:
             logger.error(f"SMILES column '{self.smiles_col}' not found in data")
             return None
             
-        # Filter valid SMILES - 중복도 처리
+        # Filter valid SMILES - handle duplicates
         valid_smiles_df = self.df[self.df[self.smiles_col].notna()].copy()
         if len(valid_smiles_df) == 0:
             logger.warning("No valid SMILES found for visualization")
             return None
             
-        # 중복된 SMILES가 있을 경우를 처리
+        # Handle duplicate SMILES if present
         if len(valid_smiles_df) > len(valid_smiles_df[self.smiles_col].unique()):
             logger.info(f"Found {len(valid_smiles_df) - len(valid_smiles_df[self.smiles_col].unique())} duplicate SMILES. Keeping first occurrence of each.")
-            # 각 고유 SMILES의 첫 번째 행만 유지
+            # Keep only the first row for each unique SMILES
             valid_smiles_df = valid_smiles_df.drop_duplicates(subset=[self.smiles_col], keep='first')
         
-        # 표시할 분자 수 제한
+        # Limit number of molecules to display
         valid_smiles_df = valid_smiles_df.head(n_mols)
             
         # Determine grid dimensions
@@ -2043,6 +2045,8 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--input_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, default="./processed_data", required=False)
+    parser.add_argument("--to-gist-matrix", action="store_true", help="Convert K-MELLODDY to GIST matrix (SMILES x GIST endpoints)")
+    parser.add_argument("--gist_output", type=str, default=None, help="Output CSV path for GIST matrix (optional)")
     parser.add_argument("--visualize", type=bool, default=False, help="Generate visualizations")
     parser.add_argument("--parallel", type=bool, default=False, help="Use parallel processing")
     parser.add_argument("--scale_activity", type=bool, default=True, help="Scale activity values")
@@ -2107,6 +2111,157 @@ if __name__ == "__main__":
     
     start_time = time.time()
     logger.info(f"Starting processing of {args.input_path}")
+
+    # Early path: GIST matrix export
+    if args.to_gist_matrix:
+        try:
+            # Add llm converter to path and import
+            llm_src = os.path.join(os.path.dirname(__file__), "llm_converter", "src")
+            if llm_src not in sys.path:
+                sys.path.append(llm_src)
+            from format_converter import ConversionConfig, LLMFormatConverter
+
+            # Load data using existing inspector (handles Measurement_Value actual column mapping)
+            inspector = DataInspector(
+                input_path=args.input_path,
+                smiles_column=args.smiles_col,
+                activity_column=args.activity_col
+            )
+            df = inspector.df.copy()
+
+            # Normalize critical column names presence
+            smiles_col = args.smiles_col if args.smiles_col in df.columns else "SMILES_Structure_Parent"
+            unit_col = "Measurement_Unit" if "Measurement_Unit" in df.columns else None
+
+            # Build canonical endpoint string using Test + Test_Type + Measurement_Type when available
+            def _safe_str(x):
+                return str(x) if (x is not None and x != "Not specified") else ""
+            c1 = df["Test"].apply(_safe_str) if "Test" in df.columns else ""
+            c2 = df["Test_Type"].apply(_safe_str) if "Test_Type" in df.columns else ""
+            c3 = df["Measurement_Type"].apply(_safe_str) if "Measurement_Type" in df.columns else (df["Measurment_Type"].apply(_safe_str) if "Measurment_Type" in df.columns else "")
+            df["endpoint_canonical"] = (c1.astype(str) + " | " + c2.astype(str) + " | " + c3.astype(str)).str.strip(" |")
+            df.loc[df["endpoint_canonical"] == "", "endpoint_canonical"] = df.get("Test", "")
+
+            # LLM endpoint mapping to GIST endpoints
+            config = ConversionConfig(
+                api_key=os.getenv("GEMINI_API_KEY", ""),
+                model_name=os.getenv("LLM_MODEL", "gemini-1.5-flash"),
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+                source=os.getenv("LLM_SOURCE", "Gemini")
+            )
+            if not config.api_key:
+                logger.error("GEMINI_API_KEY environment variable is not set.")
+                raise RuntimeError("Missing GEMINI_API_KEY for LLM mapping")
+
+            converter = LLMFormatConverter(config)
+            tmp_df = pd.DataFrame({"endpoint": df["endpoint_canonical"].unique().tolist()})
+            endpoint_map = converter.match_endpoints(tmp_df)
+            df["gist_endpoint"] = df["endpoint_canonical"].map(endpoint_map).fillna(df["endpoint_canonical"])  # fallback
+
+            # Unit conversion to SI
+            if unit_col is not None:
+                uc = UnitConverter()
+                df = uc.convert_column_to_si(df, value_col=args.activity_col, unit_col=unit_col, new_value_col="value_si", new_unit_col="unit_si")
+                value_col = "value_si"
+            else:
+                value_col = args.activity_col
+
+            # Ensure numeric type for aggregation (handle strings like '3.218e-05' or non-numeric leftovers)
+            df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
+
+            # Load GIST column list (tab-separated, first line)
+            gist_file = os.path.join(os.path.dirname(__file__), "gist", "gist_format.txt")
+            with open(gist_file, "r") as gf:
+                first_line = gf.readline().strip()
+            gist_cols = [c for c in first_line.split("\t") if c]
+            if not gist_cols:
+                raise RuntimeError("GIST endpoint list is empty. Check gist_format.txt")
+
+            # Detect PK rows (patient-origin) heuristics
+            def is_pk_row(row: pd.Series) -> bool:
+                txt = " ".join([str(row.get(col, "")) for col in ["Test", "Test_Type", "Measurement_Type", "Measurment_Type", "Test_Subject"]]).lower()
+                return ("patient" in txt) or ("pk" in txt)
+
+            pk_mask = df.apply(is_pk_row, axis=1)
+            has_pk = bool(pk_mask.any())
+
+            # ADMET: aggregate mean per SMILES x endpoint
+            admet_df = df.loc[~pk_mask].copy()
+            admet_matrix = None
+            if not admet_df.empty:
+                agg = admet_df.groupby([smiles_col, "gist_endpoint"], dropna=False)[value_col].mean().reset_index()
+                admet_matrix = agg.pivot_table(index=smiles_col, columns="gist_endpoint", values=value_col, fill_value=0).reset_index()
+                # Ensure all GIST columns exist
+                for col in gist_cols:
+                    if col not in admet_matrix.columns:
+                        admet_matrix[col] = 0
+                # Order columns: smiles then GIST columns
+                admet_matrix = admet_matrix[[smiles_col] + gist_cols]
+                admet_matrix = admet_matrix.rename(columns={smiles_col: "smiles"})
+
+            # PK: keep duplicates by expanding rows, one-hot style by endpoint
+            pk_df = df.loc[pk_mask].copy()
+            pk_matrix = None
+            if not pk_df.empty:
+                # For each row, build a record with all zeros except the matched endpoint with value
+                records = []
+                for _, row in pk_df.iterrows():
+                    rec = {"smiles": row.get(smiles_col, "")}
+                    for col in gist_cols:
+                        rec[col] = 0
+                    ge = row.get("gist_endpoint", None)
+                    if ge in gist_cols:
+                        rec[ge] = row.get(value_col, 0) if pd.notna(row.get(value_col, None)) else 0
+                    records.append(rec)
+                pk_matrix = pd.DataFrame.from_records(records)
+
+            # Concatenate
+            if admet_matrix is not None and pk_matrix is not None:
+                out_df = pd.concat([admet_matrix, pk_matrix], ignore_index=True)
+            elif admet_matrix is not None:
+                out_df = admet_matrix
+            elif pk_matrix is not None:
+                out_df = pk_matrix
+            else:
+                out_df = pd.DataFrame(columns=["smiles"] + gist_cols)
+
+            # Fill remaining NaNs with 0
+            for col in out_df.columns:
+                if col != "smiles":
+                    out_df[col] = out_df[col].fillna(0)
+
+            # Determine output path
+            base_name = os.path.basename(args.input_path).split('.')[0]
+            suffix = "_PK" if has_pk else ""
+            out_csv = args.gist_output if args.gist_output else os.path.join(args.output_path, f"{base_name}{suffix}_gist_matrix.csv")
+
+            # Save CSV
+            os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+            out_df.to_csv(out_csv, index=False)
+
+            # Save metadata
+            metadata = {
+                "input_path": args.input_path,
+                "output_csv": out_csv,
+                "rows": int(len(out_df)),
+                "columns": [c for c in out_df.columns],
+                "has_pk": has_pk,
+                "value_column": value_col,
+                "endpoint_map_size": int(len(endpoint_map)),
+            }
+            meta_path = out_csv.replace('.csv', '_metadata.json')
+            with open(meta_path, 'w', encoding='utf-8') as mf:
+                json.dump(metadata, mf, indent=2, ensure_ascii=False)
+
+            logger.info(f"Saved GIST matrix to {out_csv}")
+            logger.info(f"Saved metadata to {meta_path}")
+        except Exception as e:
+            logger.error(f"GIST matrix conversion failed: {e}")
+            raise
+        finally:
+            logger.info("Finished GIST matrix conversion")
+        # Exit after matrix export
+        sys.exit(0)
     
     try:
         # Check if input file exists
