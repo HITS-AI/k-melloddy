@@ -171,6 +171,8 @@ The pipeline supports two main file formats:
 - Combines data from both sheets for comprehensive analysis.
 - Falls back to the first sheet if specific named sheets aren't found.
 
+> Note: The latest K-MELLODDY standard data format and sample files can be downloaded from the official forum: [forum.k-melloddy.com](https://forum.k-melloddy.com/).
+
 Required columns in both formats:
 - **SMILES Column**: Contains SMILES strings of compounds (default: `SMILES_Structure_Parent`).
 - **Activity Column**: Contains numeric or categorical activity values (default: `Measurement_Value`).
