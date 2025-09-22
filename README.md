@@ -66,6 +66,45 @@ This repository will be updated when the K-MELLODDY standard data format is chan
 - **Customizable Parameters**:
   - Command-line interface for all major options.
   - Options to retain stereochemistry, remove salts, detect outliers, and handle duplicates.
+  - **NEW**: Export to GIST matrix (SMILES × GIST endpoints) via `--to-gist-matrix`
+
+## New: GIST Matrix Export (LLM-assisted)
+This pipeline can convert K-MELLODDY standard data into a GIST matrix where rows are SMILES and columns are GIST endpoints.
+
+- Endpoint matching is performed by an LLM (Gemini via LangChain) using domain-specific prompts.
+- Units are converted to SI using the built-in `UnitConverter`.
+- For ADMET data, duplicate records per SMILES/endpoints are averaged.
+- For PK (patient-origin) data, duplicate rows per SMILES are kept, and output filename includes `_PK`.
+- Missing values are filled with 0. Metadata JSON is saved alongside the CSV.
+
+### Requirements for LLM mapping
+Set the following environment variables before running:
+
+```bash
+export GEMINI_API_KEY="<your_gemini_api_key>"
+export LLM_MODEL="gemini-1.5-flash"
+export LLM_TEMPERATURE="0.1"
+export LLM_SOURCE="Gemini"
+```
+
+### GIST Endpoint List
+The list of GIST endpoints (columns) is read from `K-MELLODDY/gist/gist_format.txt` (first line, tab-separated).
+
+### Usage
+Run from the `K-MELLODDY` directory:
+
+```bash
+conda activate goldilocks
+python hits-preprocess.py \
+  --input_path input_data/Des_43404_PAMPA_Caco-2_MDCK_250829.xlsx \
+  --output_path . \
+  --to-gist-matrix \
+  --debug
+```
+
+Generated files:
+- `*_gist_matrix.csv` (or `*_PK_gist_matrix.csv` if PK rows detected)
+- Corresponding `*_gist_matrix_metadata.json`
 
 ## Installation
 1. Clone the repository:
@@ -131,6 +170,8 @@ The pipeline supports two main file formats:
 - **NEW**: Supports new K-MELLODDY format with '데이터' sheet (header at row 2).
 - Combines data from both sheets for comprehensive analysis.
 - Falls back to the first sheet if specific named sheets aren't found.
+
+> Note: The latest K-MELLODDY standard data format and sample files can be downloaded from the official forum: [forum.k-melloddy.com](https://forum.k-melloddy.com/).
 
 Required columns in both formats:
 - **SMILES Column**: Contains SMILES strings of compounds (default: `SMILES_Structure_Parent`).
