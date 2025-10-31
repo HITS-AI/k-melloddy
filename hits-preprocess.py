@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import datetime
 import re
+import textwrap
 
 # Set pandas display options
 pd.set_option('display.max_rows', None)  # Show all rows
@@ -16,10 +17,12 @@ pd.set_option('display.width', None)  # Auto-detect display width
 pd.set_option('display.max_colwidth', None)  # Show full content of each column
 pd.set_option('display.expand_frame_repr', False)  # Don't wrap wide frames
 
-from argparse import ArgumentParser
 import sys
 import json
 from typing import Iterable, List, Tuple, Dict, Any, Optional
+from dataclasses import dataclass
+from omegaconf import OmegaConf, DictConfig, MISSING
+from omegaconf.errors import ConfigKeyError, ValidationError
 from rdkit import Chem
 from rdkit.Chem import SaltRemover, MolStandardize, Draw
 from rdkit.Chem.Scaffolds import MurckoScaffold
@@ -46,6 +49,121 @@ except ImportError:
     logger.warning("pint package not available. Unit conversion will be disabled.")
 
 # The logger will be configured with file handler in main
+
+
+@dataclass
+class PreprocessConfig:
+    """
+    Structured configuration for the preprocessing pipeline.
+    OmegaConf validates types and keeps attribute-style access.
+    """
+    input_path: str = MISSING
+    output_path: str = "./processed_data"
+    to_gist_matrix: bool = False
+    gist_output: Optional[str] = None
+    visualize: bool = False
+    parallel: bool = False
+    scale_activity: bool = True
+    convert_units: bool = True
+    correct_pH: bool = False
+    pH_method: str = "all"
+    target_pH: float = 7.4
+    endpoint_mapper: str = "llm"
+    manual_mapping_path: Optional[str] = None
+    manual_min_similarity: float = 0.55
+    manual_prefer_exact: bool = True
+    split: Optional[str] = None
+    test_size: float = 0.2
+    valid_size: float = 0.1
+    activity_col: str = "Measurement_Value"
+    smiles_col: str = "SMILES_Structure_Parent"
+    debug: bool = False
+    config: Optional[str] = None
+
+
+def _convert_argparse_style_to_cli(argv: List[str]) -> List[str]:
+    """
+    Convert traditional argparse style flags (e.g. --flag value) to OmegaConf overrides.
+    This keeps backward compatibility with existing shell scripts.
+    """
+    converted: List[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("--"):
+            key = token.lstrip("-")
+            if "=" in key:
+                key_segment, raw_value = key.split("=", 1)
+                converted.append(f"{key_segment.replace('-', '_')}={raw_value}")
+                i += 1
+                continue
+
+            normalized_key = key.replace("-", "_")
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                value = argv[i + 1]
+                i += 2
+            else:
+                value = "true"
+                i += 1
+            converted.append(f"{normalized_key}={value}")
+        else:
+            converted.append(token)
+            i += 1
+    return converted
+
+
+def _print_help() -> None:
+    help_text = textwrap.dedent(
+        """
+        Usage:
+          python hits-preprocess.py [--config CONFIG] [options]
+
+        Options:
+          --config PATH              Path to a YAML config file with defaults.
+          --input_path PATH          Path to input CSV/XLSX file (required if not set in config).
+          --output_path PATH         Directory for processed outputs (default: ./processed_data).
+          --to-gist-matrix [bool]    Convert to GIST matrix outputs (default: false).
+          --gist_output PATH         Explicit output CSV path for GIST matrix.
+          --visualize [bool]         Generate visualizations (default: false).
+          --parallel [bool]          Enable multiprocessing pipeline (default: false).
+          --scale_activity [bool]    Scale activity values (default: true).
+          --convert_units [bool]     Convert measurement units to SI (default: true).
+          --correct_pH [bool]        Apply pH correction (default: false).
+          --pH_method CHOICE         pH correction method: all|henderson_hasselbalch|empirical|molecular_properties.
+          --target_pH FLOAT          Target pH value (default: 7.4).
+          --endpoint_mapper CHOICE   Endpoint mapping mode: llm|manual (default: llm).
+          --manual_mapping_path PATH Optional CSV/JSON of custom endpoint mappings for manual mode.
+          --manual_min_similarity F  Minimum similarity score (0-1) for manual matching (default: 0.55).
+          --manual_prefer_exact B    Prefer exact synonym hits before similarity (default: true).
+          --split CHOICE             Data split method: random|scaffold|stratified.
+          --test_size FLOAT          Test split ratio (default: 0.2).
+          --valid_size FLOAT         Validation split ratio (default: 0.1).
+          --activity_col NAME        Activity column name (default: Measurement_Value).
+          --smiles_col NAME          SMILES column name (default: SMILES_Structure_Parent).
+          --debug [bool]             Enable debug logging (default: false).
+
+        Notes:
+          • Boolean flags accept true/false values (e.g., --visualize true).
+          • CLI arguments always override values loaded from --config.
+          • Example: python hits-preprocess.py --config config/preprocess_defaults.yaml --split scaffold
+        """
+    ).strip("\n")
+    print(help_text)
+
+
+def _safe_merge(*configs: Any) -> DictConfig:
+    try:
+        return OmegaConf.merge(*configs)
+    except (ValidationError, ConfigKeyError) as exc:
+        raise ValueError(f"Invalid configuration option: {exc}") from exc
+
+
+def _ensure_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 def recognize_task_type(each_df, activity_col='Measurement_Value'):
     """
@@ -1529,8 +1647,44 @@ class Preprocessor:
                             break
                     
                     if pH_col is None:
-                        logger.warning("pH column not found. pH correction will be skipped.")
-                    else:
+                        # Attempt to infer pH from Test_Type like "..._pH4.0" or strings containing "pH 4.0"
+                        inferred_col = 'inferred_pH'
+                        try:
+                            # Initialize with NaN
+                            self.df[inferred_col] = np.nan
+                            # Extract pH using regex; supports formats: pH4, pH4.0, pH 4.0
+                            # Also handles embedded tokens like "Solubility_pH4.0"
+                            pattern = re.compile(r"pH\s*([0-9]+(?:\.[0-9]+)?)", flags=re.IGNORECASE)
+                            def _extract_ph(text: Any) -> Optional[float]:
+                                s = str(text)
+                                m = pattern.search(s)
+                                if m:
+                                    try:
+                                        return float(m.group(1))
+                                    except Exception:
+                                        return None
+                                # Handle underscore-separated tokens ending with pH number (e.g., _pH4.0)
+                                # General fallback: split on non-alnum and look for tokens starting with 'ph'
+                                tokens = re.split(r"[^A-Za-z0-9\.]+", s)
+                                for tok in tokens:
+                                    if tok.lower().startswith('ph'):
+                                        num = tok[2:]
+                                        if num:
+                                            try:
+                                                return float(num)
+                                            except Exception:
+                                                continue
+                                return None
+                            # Apply only to pH-related rows
+                            self.df.loc[pH_data_mask, inferred_col] = self.df.loc[pH_data_mask, 'Test_Type'].apply(_extract_ph)
+                            if self.df.loc[pH_data_mask, inferred_col].notna().any():
+                                pH_col = inferred_col
+                                logger.info("Inferred pH values from Test_Type; proceeding with pH correction.")
+                            else:
+                                logger.warning("pH column not found and could not infer from Test_Type. pH correction will be skipped.")
+                        except Exception as infer_err:
+                            logger.warning(f"Failed to infer pH from Test_Type: {infer_err}. pH correction will be skipped.")
+                    if pH_col is not None:
                         logger.info(f"Using pH column: {pH_col}")
                         
                         # Perform pH correction only on pH-related data
@@ -2042,29 +2196,46 @@ std2gist = {
 }
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--input_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, default="./processed_data", required=False)
-    parser.add_argument("--to-gist-matrix", action="store_true", help="Convert K-MELLODDY to GIST matrix (SMILES x GIST endpoints)")
-    parser.add_argument("--gist_output", type=str, default=None, help="Output CSV path for GIST matrix (optional)")
-    parser.add_argument("--visualize", type=bool, default=False, help="Generate visualizations")
-    parser.add_argument("--parallel", type=bool, default=False, help="Use parallel processing")
-    parser.add_argument("--scale_activity", type=bool, default=True, help="Scale activity values")
-    parser.add_argument("--convert_units", type=bool, default=True, help="Convert units to SI units")
-    parser.add_argument("--correct_pH", type=bool, default=False, help="Correct pH-dependent activity values")
-    parser.add_argument("--pH_method", choices=["all", "henderson_hasselbalch", "empirical", "molecular_properties"], 
-                      default="all", help="pH correction method")
-    parser.add_argument("--target_pH", type=float, default=7.4, help="Target pH for correction (default: 7.4)")
-    parser.add_argument("--split", choices=["random", "scaffold", "stratified"], 
-                      help="Split data for machine learning")
-    parser.add_argument("--test_size", type=float, default=0.2, help="Test set size")
-    parser.add_argument("--valid_size", type=float, default=0.1, help="Validation set size")
-    parser.add_argument("--activity_col", type=str, default="Measurement_Value", 
-                     help="Column name for activity values")
-    parser.add_argument("--smiles_col", type=str, default="SMILES_Structure_Parent",
-                     help="Column name for SMILES structures")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    raw_args = sys.argv[1:]
+    if any(flag in raw_args for flag in ("-h", "--help")):
+        _print_help()
+        sys.exit(0)
+
+    default_cfg: DictConfig = OmegaConf.structured(PreprocessConfig)
+    cli_overrides = _convert_argparse_style_to_cli(raw_args)
+    try:
+        cli_conf = OmegaConf.from_cli(cli_overrides)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse command line arguments: {exc}") from exc
+
+    # Merge defaults with CLI to discover config path
+    merged_cfg: DictConfig = _safe_merge(default_cfg, cli_conf)
+    config_path = merged_cfg.get("config")
+
+    if config_path:
+        config_path = os.path.expanduser(config_path)
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
+        file_cfg = OmegaConf.load(config_path)
+        args: DictConfig = _safe_merge(default_cfg, file_cfg, cli_conf)
+    else:
+        args = merged_cfg
+
+    if OmegaConf.is_missing(args, "input_path") or not args.input_path:
+        raise ValueError("`input_path` must be provided via CLI or configuration file.")
+
+    allowed_pH_methods = {"all", "henderson_hasselbalch", "empirical", "molecular_properties"}
+    if args.pH_method not in allowed_pH_methods:
+        raise ValueError(f"Invalid pH_method '{args.pH_method}'. Choose from: {sorted(allowed_pH_methods)}")
+
+    if args.split is not None:
+        allowed_splits = {"random", "scaffold", "stratified"}
+        if args.split not in allowed_splits:
+            raise ValueError(f"Invalid split '{args.split}'. Choose from: {sorted(allowed_splits)}")
+    
+    allowed_mappers = {"llm", "manual"}
+    if args.endpoint_mapper not in allowed_mappers:
+        raise ValueError(f"Invalid endpoint_mapper '{args.endpoint_mapper}'. Choose from: {sorted(allowed_mappers)}")
     
     # Create output directory if it doesn't exist
     if not os.path.exists(args.output_path):
@@ -2115,12 +2286,18 @@ if __name__ == "__main__":
     # Early path: GIST matrix export
     if args.to_gist_matrix:
         try:
-            # Add llm converter to path and import
+            # Add converters to path and import
             llm_src = os.path.join(os.path.dirname(__file__), "llm_converter", "src")
             if llm_src not in sys.path:
                 sys.path.append(llm_src)
-            from format_converter import ConversionConfig, LLMFormatConverter
-
+            from manual_converter import ManualConversionConfig, ManualFormatConverter
+            try:
+                from format_converter import ConversionConfig, LLMFormatConverter  # type: ignore
+            except ImportError:
+                ConversionConfig = None  # type: ignore
+                LLMFormatConverter = None  # type: ignore
+                logger.warning("format_converter module not available; LLM mapping disabled.")
+            
             # Load data using existing inspector (handles Measurement_Value actual column mapping)
             inspector = DataInspector(
                 input_path=args.input_path,
@@ -2142,21 +2319,42 @@ if __name__ == "__main__":
             df["endpoint_canonical"] = (c1.astype(str) + " | " + c2.astype(str) + " | " + c3.astype(str)).str.strip(" |")
             df.loc[df["endpoint_canonical"] == "", "endpoint_canonical"] = df.get("Test", "")
 
-            # LLM endpoint mapping to GIST endpoints
-            config = ConversionConfig(
-                api_key=os.getenv("GEMINI_API_KEY", ""),
-                model_name=os.getenv("LLM_MODEL", "gemini-1.5-flash"),
-                temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
-                source=os.getenv("LLM_SOURCE", "Gemini")
+            manual_config = ManualConversionConfig(
+                mapping_path=args.manual_mapping_path,
+                min_similarity=float(args.manual_min_similarity),
+                prefer_exact=_ensure_bool(args.manual_prefer_exact),
             )
-            if not config.api_key:
-                logger.error("GEMINI_API_KEY environment variable is not set.")
-                raise RuntimeError("Missing GEMINI_API_KEY for LLM mapping")
+            manual_converter = ManualFormatConverter(manual_config)
 
-            converter = LLMFormatConverter(config)
+            mapper_choice = args.endpoint_mapper.lower()
+            mapping_strategy = mapper_choice
+            converter = None
+
+            if mapper_choice == "llm" and LLMFormatConverter and ConversionConfig:
+                config = ConversionConfig(
+                    api_key=os.getenv("GEMINI_API_KEY", ""),
+                    model_name=os.getenv("LLM_MODEL", "gemini-1.5-flash"),
+                    temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+                    source=os.getenv("LLM_SOURCE", "Gemini")
+                )
+                if not config.api_key:
+                    logger.warning("GEMINI_API_KEY environment variable is not set. Falling back to manual endpoint mapping.")
+                else:
+                    try:
+                        converter = LLMFormatConverter(config)
+                        mapping_strategy = "llm"
+                    except Exception as converter_error:
+                        logger.warning("LLM converter initialization failed (%s). Using manual mapping.", converter_error)
+                        converter = None
+
+            if converter is None:
+                mapping_strategy = "manual"
+                converter = manual_converter
+
             tmp_df = pd.DataFrame({"endpoint": df["endpoint_canonical"].unique().tolist()})
             endpoint_map = converter.match_endpoints(tmp_df)
             df["gist_endpoint"] = df["endpoint_canonical"].map(endpoint_map).fillna(df["endpoint_canonical"])  # fallback
+            logger.info(f"Endpoint mapping strategy used: {mapping_strategy.upper()}")
 
             # Unit conversion to SI
             if unit_col is not None:
@@ -2248,7 +2446,13 @@ if __name__ == "__main__":
                 "has_pk": has_pk,
                 "value_column": value_col,
                 "endpoint_map_size": int(len(endpoint_map)),
+                "endpoint_mapper": mapping_strategy,
             }
+            if mapping_strategy == "manual":
+                metadata.update({
+                    "manual_min_similarity": float(manual_config.min_similarity),
+                    "manual_mapping_path": manual_config.mapping_path,
+                })
             meta_path = out_csv.replace('.csv', '_metadata.json')
             with open(meta_path, 'w', encoding='utf-8') as mf:
                 json.dump(metadata, mf, indent=2, ensure_ascii=False)
