@@ -1647,8 +1647,44 @@ class Preprocessor:
                             break
                     
                     if pH_col is None:
-                        logger.warning("pH column not found. pH correction will be skipped.")
-                    else:
+                        # Attempt to infer pH from Test_Type like "..._pH4.0" or strings containing "pH 4.0"
+                        inferred_col = 'inferred_pH'
+                        try:
+                            # Initialize with NaN
+                            self.df[inferred_col] = np.nan
+                            # Extract pH using regex; supports formats: pH4, pH4.0, pH 4.0
+                            # Also handles embedded tokens like "Solubility_pH4.0"
+                            pattern = re.compile(r"pH\s*([0-9]+(?:\.[0-9]+)?)", flags=re.IGNORECASE)
+                            def _extract_ph(text: Any) -> Optional[float]:
+                                s = str(text)
+                                m = pattern.search(s)
+                                if m:
+                                    try:
+                                        return float(m.group(1))
+                                    except Exception:
+                                        return None
+                                # Handle underscore-separated tokens ending with pH number (e.g., _pH4.0)
+                                # General fallback: split on non-alnum and look for tokens starting with 'ph'
+                                tokens = re.split(r"[^A-Za-z0-9\.]+", s)
+                                for tok in tokens:
+                                    if tok.lower().startswith('ph'):
+                                        num = tok[2:]
+                                        if num:
+                                            try:
+                                                return float(num)
+                                            except Exception:
+                                                continue
+                                return None
+                            # Apply only to pH-related rows
+                            self.df.loc[pH_data_mask, inferred_col] = self.df.loc[pH_data_mask, 'Test_Type'].apply(_extract_ph)
+                            if self.df.loc[pH_data_mask, inferred_col].notna().any():
+                                pH_col = inferred_col
+                                logger.info("Inferred pH values from Test_Type; proceeding with pH correction.")
+                            else:
+                                logger.warning("pH column not found and could not infer from Test_Type. pH correction will be skipped.")
+                        except Exception as infer_err:
+                            logger.warning(f"Failed to infer pH from Test_Type: {infer_err}. pH correction will be skipped.")
+                    if pH_col is not None:
                         logger.info(f"Using pH column: {pH_col}")
                         
                         # Perform pH correction only on pH-related data

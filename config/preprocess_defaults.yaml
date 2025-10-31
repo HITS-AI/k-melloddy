@@ -1,11 +1,11 @@
 # Default configuration for the hits-preprocess pipeline.
 # Update `input_path` to point to your K-MELLODDY standard dataset before running.
-input_path: ./input_data/data_sample.csv
+input_path: ./forum_sample/71900_250327_Solubility_Solubility_pH4.0_Not_specified_Not_specified_processed.csv
 
 # General output options
 output_path: ./processed_data
 gist_output: null
-to_gist_matrix: false
+to_gist_matrix: true
 
 # Processing toggles
 visualize: false
@@ -14,13 +14,13 @@ scale_activity: true
 convert_units: true
 
 # Endpoint mapping
-endpoint_mapper: llm  # llm or manual
+endpoint_mapper: manual  # llm or manual
 manual_mapping_path: null
 manual_min_similarity: 0.55
 manual_prefer_exact: true
 
 # pH correction
-correct_pH: false
+correct_pH: true
 pH_method: all  # one of [all, henderson_hasselbalch, empirical, molecular_properties]
 target_pH: 7.4
 
@@ -30,8 +30,8 @@ test_size: 0.2
 valid_size: 0.1
 
 # Column names
-activity_col: Measurement_Value
-smiles_col: SMILES_Structure_Parent
+activity_col: Measurement_Value_scaled
+smiles_col: Standardized_SMILES
 
 # Logging
 debug: false
