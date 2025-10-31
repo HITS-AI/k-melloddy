@@ -68,6 +68,10 @@ class PreprocessConfig:
     correct_pH: bool = False
     pH_method: str = "all"
     target_pH: float = 7.4
+    endpoint_mapper: str = "llm"
+    manual_mapping_path: Optional[str] = None
+    manual_min_similarity: float = 0.55
+    manual_prefer_exact: bool = True
     split: Optional[str] = None
     test_size: float = 0.2
     valid_size: float = 0.1
@@ -127,6 +131,10 @@ def _print_help() -> None:
           --correct_pH [bool]        Apply pH correction (default: false).
           --pH_method CHOICE         pH correction method: all|henderson_hasselbalch|empirical|molecular_properties.
           --target_pH FLOAT          Target pH value (default: 7.4).
+          --endpoint_mapper CHOICE   Endpoint mapping mode: llm|manual (default: llm).
+          --manual_mapping_path PATH Optional CSV/JSON of custom endpoint mappings for manual mode.
+          --manual_min_similarity F  Minimum similarity score (0-1) for manual matching (default: 0.55).
+          --manual_prefer_exact B    Prefer exact synonym hits before similarity (default: true).
           --split CHOICE             Data split method: random|scaffold|stratified.
           --test_size FLOAT          Test split ratio (default: 0.2).
           --valid_size FLOAT         Validation split ratio (default: 0.1).
@@ -148,6 +156,14 @@ def _safe_merge(*configs: Any) -> DictConfig:
         return OmegaConf.merge(*configs)
     except (ValidationError, ConfigKeyError) as exc:
         raise ValueError(f"Invalid configuration option: {exc}") from exc
+
+
+def _ensure_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 def recognize_task_type(each_df, activity_col='Measurement_Value'):
     """
@@ -2181,6 +2197,10 @@ if __name__ == "__main__":
         if args.split not in allowed_splits:
             raise ValueError(f"Invalid split '{args.split}'. Choose from: {sorted(allowed_splits)}")
     
+    allowed_mappers = {"llm", "manual"}
+    if args.endpoint_mapper not in allowed_mappers:
+        raise ValueError(f"Invalid endpoint_mapper '{args.endpoint_mapper}'. Choose from: {sorted(allowed_mappers)}")
+    
     # Create output directory if it doesn't exist
     if not os.path.exists(args.output_path):
         os.makedirs(args.output_path)
@@ -2230,12 +2250,18 @@ if __name__ == "__main__":
     # Early path: GIST matrix export
     if args.to_gist_matrix:
         try:
-            # Add llm converter to path and import
+            # Add converters to path and import
             llm_src = os.path.join(os.path.dirname(__file__), "llm_converter", "src")
             if llm_src not in sys.path:
                 sys.path.append(llm_src)
-            from format_converter import ConversionConfig, LLMFormatConverter
-
+            from manual_converter import ManualConversionConfig, ManualFormatConverter
+            try:
+                from format_converter import ConversionConfig, LLMFormatConverter  # type: ignore
+            except ImportError:
+                ConversionConfig = None  # type: ignore
+                LLMFormatConverter = None  # type: ignore
+                logger.warning("format_converter module not available; LLM mapping disabled.")
+            
             # Load data using existing inspector (handles Measurement_Value actual column mapping)
             inspector = DataInspector(
                 input_path=args.input_path,
@@ -2257,21 +2283,42 @@ if __name__ == "__main__":
             df["endpoint_canonical"] = (c1.astype(str) + " | " + c2.astype(str) + " | " + c3.astype(str)).str.strip(" |")
             df.loc[df["endpoint_canonical"] == "", "endpoint_canonical"] = df.get("Test", "")
 
-            # LLM endpoint mapping to GIST endpoints
-            config = ConversionConfig(
-                api_key=os.getenv("GEMINI_API_KEY", ""),
-                model_name=os.getenv("LLM_MODEL", "gemini-1.5-flash"),
-                temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
-                source=os.getenv("LLM_SOURCE", "Gemini")
+            manual_config = ManualConversionConfig(
+                mapping_path=args.manual_mapping_path,
+                min_similarity=float(args.manual_min_similarity),
+                prefer_exact=_ensure_bool(args.manual_prefer_exact),
             )
-            if not config.api_key:
-                logger.error("GEMINI_API_KEY environment variable is not set.")
-                raise RuntimeError("Missing GEMINI_API_KEY for LLM mapping")
+            manual_converter = ManualFormatConverter(manual_config)
 
-            converter = LLMFormatConverter(config)
+            mapper_choice = args.endpoint_mapper.lower()
+            mapping_strategy = mapper_choice
+            converter = None
+
+            if mapper_choice == "llm" and LLMFormatConverter and ConversionConfig:
+                config = ConversionConfig(
+                    api_key=os.getenv("GEMINI_API_KEY", ""),
+                    model_name=os.getenv("LLM_MODEL", "gemini-1.5-flash"),
+                    temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+                    source=os.getenv("LLM_SOURCE", "Gemini")
+                )
+                if not config.api_key:
+                    logger.warning("GEMINI_API_KEY environment variable is not set. Falling back to manual endpoint mapping.")
+                else:
+                    try:
+                        converter = LLMFormatConverter(config)
+                        mapping_strategy = "llm"
+                    except Exception as converter_error:
+                        logger.warning("LLM converter initialization failed (%s). Using manual mapping.", converter_error)
+                        converter = None
+
+            if converter is None:
+                mapping_strategy = "manual"
+                converter = manual_converter
+
             tmp_df = pd.DataFrame({"endpoint": df["endpoint_canonical"].unique().tolist()})
             endpoint_map = converter.match_endpoints(tmp_df)
             df["gist_endpoint"] = df["endpoint_canonical"].map(endpoint_map).fillna(df["endpoint_canonical"])  # fallback
+            logger.info(f"Endpoint mapping strategy used: {mapping_strategy.upper()}")
 
             # Unit conversion to SI
             if unit_col is not None:
@@ -2363,7 +2410,13 @@ if __name__ == "__main__":
                 "has_pk": has_pk,
                 "value_column": value_col,
                 "endpoint_map_size": int(len(endpoint_map)),
+                "endpoint_mapper": mapping_strategy,
             }
+            if mapping_strategy == "manual":
+                metadata.update({
+                    "manual_min_similarity": float(manual_config.min_similarity),
+                    "manual_mapping_path": manual_config.mapping_path,
+                })
             meta_path = out_csv.replace('.csv', '_metadata.json')
             with open(meta_path, 'w', encoding='utf-8') as mf:
                 json.dump(metadata, mf, indent=2, ensure_ascii=False)

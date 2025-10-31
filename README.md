@@ -66,6 +66,7 @@ This repository will be updated when the K-MELLODDY standard data format is chan
 - **Customizable Parameters**:
   - Command-line interface for all major options.
   - OmegaConf-backed configuration files with CLI overrides for reproducible runs.
+  - Offline-friendly manual endpoint mapping fallback when LLM APIs are unavailable.
   - Options to retain stereochemistry, remove salts, detect outliers, and handle duplicates.
   - **NEW**: Export to GIST matrix (SMILES × GIST endpoints) via `--to-gist-matrix`
 
@@ -77,6 +78,11 @@ This pipeline can convert K-MELLODDY standard data into a GIST matrix where rows
 - For ADMET data, duplicate records per SMILES/endpoints are averaged.
 - For PK (patient-origin) data, duplicate rows per SMILES are kept, and output filename includes `_PK`.
 - Missing values are filled with 0. Metadata JSON is saved alongside the CSV.
+
+### Endpoint Mapping Modes
+- `llm`: Uses `llm_converter/src/format_converter.py` with LangChain + Gemini/OpenAI (requires `GEMINI_API_KEY`).
+- `manual`: Uses `llm_converter/src/manual_converter.py`, a synonym/similarity-based mapper that runs fully offline.
+- When `endpoint_mapper` is set to `llm` but credentials or dependencies are missing, the pipeline automatically falls back to `manual` and records the strategy in metadata.
 
 ### Requirements for LLM mapping
 Set the following environment variables before running:
@@ -134,6 +140,7 @@ python hits-preprocess.py \
 - Pass `--config path/to/your_config.yaml` (or `config=...`) to load another YAML file. Subsequent CLI flags override the file values.
 - Arguments still accept `--flag value` syntax; boolean flags can be toggled with `--flag true/false` or `flag=true`.
 - To run without a config file, omit `--config` and supply all necessary options on the command line; `--input_path` remains required.
+- Choose the endpoint mapping mode via `endpoint_mapper` (`llm` or `manual`); manual mode needs no API key and supports optional custom synonym files.
 
 ### Key Command Line Arguments
 | Argument | Description |
@@ -148,6 +155,10 @@ python hits-preprocess.py \
 | `--correct_pH` | Correct pH-dependent activity values (True/False) |
 | `--pH_method` | pH correction method (all, henderson_hasselbalch, empirical, molecular_properties) |
 | `--target_pH` | Target pH for correction (default: 7.4) |
+| `--endpoint_mapper` | Endpoint mapping mode (`llm` or `manual`, default: `llm`) |
+| `--manual_mapping_path` | Optional CSV/JSON for additional manual endpoint synonyms |
+| `--manual_min_similarity` | Minimum similarity threshold for manual mapping (default: 0.55) |
+| `--manual_prefer_exact` | Prefer exact synonym hits before similarity (True/False) |
 | `--split` | Data splitting method (random, scaffold, stratified) |
 | `--test_size` | Test set size (default: 0.2) |
 | `--valid_size` | Validation set size (default: 0.1) |

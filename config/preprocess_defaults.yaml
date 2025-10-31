@@ -13,6 +13,12 @@ parallel: false
 scale_activity: true
 convert_units: true
 
+# Endpoint mapping
+endpoint_mapper: llm  # llm or manual
+manual_mapping_path: null
+manual_min_similarity: 0.55
+manual_prefer_exact: true
+
 # pH correction
 correct_pH: false
 pH_method: all  # one of [all, henderson_hasselbalch, empirical, molecular_properties]
