@@ -65,6 +65,7 @@ This repository will be updated when the K-MELLODDY standard data format is chan
   - Ensures valid filenames across different operating systems.
 - **Customizable Parameters**:
   - Command-line interface for all major options.
+  - OmegaConf-backed configuration files with CLI overrides for reproducible runs.
   - Options to retain stereochemistry, remove salts, detect outliers, and handle duplicates.
   - **NEW**: Export to GIST matrix (SMILES × GIST endpoints) via `--to-gist-matrix`
 
@@ -120,12 +121,24 @@ Generated files:
 ## Usage
 ### Command Line Usage
 ```bash
-python hits-preprocess.py --input_path input_data/data_sample.csv --output_path ./processed_data --visualize True --parallel True --split scaffold --activity_col "Measurement_Value"
+python hits-preprocess.py \
+  --config config/preprocess_defaults.yaml \
+  --input_path input_data/data_sample.csv \
+  --split scaffold \
+  --visualize true \
+  --parallel true
 ```
+
+### Configuration (OmegaConf)
+- The script loads defaults from `config/preprocess_defaults.yaml`. Copy and modify this file for project-specific presets.
+- Pass `--config path/to/your_config.yaml` (or `config=...`) to load another YAML file. Subsequent CLI flags override the file values.
+- Arguments still accept `--flag value` syntax; boolean flags can be toggled with `--flag true/false` or `flag=true`.
+- To run without a config file, omit `--config` and supply all necessary options on the command line; `--input_path` remains required.
 
 ### Key Command Line Arguments
 | Argument | Description |
 |----------|-------------|
+| `--config` | Path to a YAML config file (e.g. `config/preprocess_defaults.yaml`) |
 | `--input_path` | Path to the input file (CSV or Excel) (required) |
 | `--output_path` | Directory to save processed data (default: ./processed_data) |
 | `--visualize` | Generate visualizations (True/False) |
@@ -234,6 +247,7 @@ Implements data splitting methods for preparing machine learning datasets.
 - `multiprocessing`
 - `openpyxl` (for Excel file support)
 - `pint` (for unit conversion)
+- `omegaconf` (for YAML/CLI configuration management)
   
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

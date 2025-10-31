@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import datetime
 import re
+import textwrap
 
 # Set pandas display options
 pd.set_option('display.max_rows', None)  # Show all rows
@@ -16,10 +17,12 @@ pd.set_option('display.width', None)  # Auto-detect display width
 pd.set_option('display.max_colwidth', None)  # Show full content of each column
 pd.set_option('display.expand_frame_repr', False)  # Don't wrap wide frames
 
-from argparse import ArgumentParser
 import sys
 import json
 from typing import Iterable, List, Tuple, Dict, Any, Optional
+from dataclasses import dataclass
+from omegaconf import OmegaConf, DictConfig, MISSING
+from omegaconf.errors import ConfigKeyError, ValidationError
 from rdkit import Chem
 from rdkit.Chem import SaltRemover, MolStandardize, Draw
 from rdkit.Chem.Scaffolds import MurckoScaffold
@@ -46,6 +49,105 @@ except ImportError:
     logger.warning("pint package not available. Unit conversion will be disabled.")
 
 # The logger will be configured with file handler in main
+
+
+@dataclass
+class PreprocessConfig:
+    """
+    Structured configuration for the preprocessing pipeline.
+    OmegaConf validates types and keeps attribute-style access.
+    """
+    input_path: str = MISSING
+    output_path: str = "./processed_data"
+    to_gist_matrix: bool = False
+    gist_output: Optional[str] = None
+    visualize: bool = False
+    parallel: bool = False
+    scale_activity: bool = True
+    convert_units: bool = True
+    correct_pH: bool = False
+    pH_method: str = "all"
+    target_pH: float = 7.4
+    split: Optional[str] = None
+    test_size: float = 0.2
+    valid_size: float = 0.1
+    activity_col: str = "Measurement_Value"
+    smiles_col: str = "SMILES_Structure_Parent"
+    debug: bool = False
+    config: Optional[str] = None
+
+
+def _convert_argparse_style_to_cli(argv: List[str]) -> List[str]:
+    """
+    Convert traditional argparse style flags (e.g. --flag value) to OmegaConf overrides.
+    This keeps backward compatibility with existing shell scripts.
+    """
+    converted: List[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("--"):
+            key = token.lstrip("-")
+            if "=" in key:
+                key_segment, raw_value = key.split("=", 1)
+                converted.append(f"{key_segment.replace('-', '_')}={raw_value}")
+                i += 1
+                continue
+
+            normalized_key = key.replace("-", "_")
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                value = argv[i + 1]
+                i += 2
+            else:
+                value = "true"
+                i += 1
+            converted.append(f"{normalized_key}={value}")
+        else:
+            converted.append(token)
+            i += 1
+    return converted
+
+
+def _print_help() -> None:
+    help_text = textwrap.dedent(
+        """
+        Usage:
+          python hits-preprocess.py [--config CONFIG] [options]
+
+        Options:
+          --config PATH              Path to a YAML config file with defaults.
+          --input_path PATH          Path to input CSV/XLSX file (required if not set in config).
+          --output_path PATH         Directory for processed outputs (default: ./processed_data).
+          --to-gist-matrix [bool]    Convert to GIST matrix outputs (default: false).
+          --gist_output PATH         Explicit output CSV path for GIST matrix.
+          --visualize [bool]         Generate visualizations (default: false).
+          --parallel [bool]          Enable multiprocessing pipeline (default: false).
+          --scale_activity [bool]    Scale activity values (default: true).
+          --convert_units [bool]     Convert measurement units to SI (default: true).
+          --correct_pH [bool]        Apply pH correction (default: false).
+          --pH_method CHOICE         pH correction method: all|henderson_hasselbalch|empirical|molecular_properties.
+          --target_pH FLOAT          Target pH value (default: 7.4).
+          --split CHOICE             Data split method: random|scaffold|stratified.
+          --test_size FLOAT          Test split ratio (default: 0.2).
+          --valid_size FLOAT         Validation split ratio (default: 0.1).
+          --activity_col NAME        Activity column name (default: Measurement_Value).
+          --smiles_col NAME          SMILES column name (default: SMILES_Structure_Parent).
+          --debug [bool]             Enable debug logging (default: false).
+
+        Notes:
+          • Boolean flags accept true/false values (e.g., --visualize true).
+          • CLI arguments always override values loaded from --config.
+          • Example: python hits-preprocess.py --config config/preprocess_defaults.yaml --split scaffold
+        """
+    ).strip("\n")
+    print(help_text)
+
+
+def _safe_merge(*configs: Any) -> DictConfig:
+    try:
+        return OmegaConf.merge(*configs)
+    except (ValidationError, ConfigKeyError) as exc:
+        raise ValueError(f"Invalid configuration option: {exc}") from exc
 
 def recognize_task_type(each_df, activity_col='Measurement_Value'):
     """
@@ -2042,29 +2144,42 @@ std2gist = {
 }
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--input_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, default="./processed_data", required=False)
-    parser.add_argument("--to-gist-matrix", action="store_true", help="Convert K-MELLODDY to GIST matrix (SMILES x GIST endpoints)")
-    parser.add_argument("--gist_output", type=str, default=None, help="Output CSV path for GIST matrix (optional)")
-    parser.add_argument("--visualize", type=bool, default=False, help="Generate visualizations")
-    parser.add_argument("--parallel", type=bool, default=False, help="Use parallel processing")
-    parser.add_argument("--scale_activity", type=bool, default=True, help="Scale activity values")
-    parser.add_argument("--convert_units", type=bool, default=True, help="Convert units to SI units")
-    parser.add_argument("--correct_pH", type=bool, default=False, help="Correct pH-dependent activity values")
-    parser.add_argument("--pH_method", choices=["all", "henderson_hasselbalch", "empirical", "molecular_properties"], 
-                      default="all", help="pH correction method")
-    parser.add_argument("--target_pH", type=float, default=7.4, help="Target pH for correction (default: 7.4)")
-    parser.add_argument("--split", choices=["random", "scaffold", "stratified"], 
-                      help="Split data for machine learning")
-    parser.add_argument("--test_size", type=float, default=0.2, help="Test set size")
-    parser.add_argument("--valid_size", type=float, default=0.1, help="Validation set size")
-    parser.add_argument("--activity_col", type=str, default="Measurement_Value", 
-                     help="Column name for activity values")
-    parser.add_argument("--smiles_col", type=str, default="SMILES_Structure_Parent",
-                     help="Column name for SMILES structures")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    raw_args = sys.argv[1:]
+    if any(flag in raw_args for flag in ("-h", "--help")):
+        _print_help()
+        sys.exit(0)
+
+    default_cfg: DictConfig = OmegaConf.structured(PreprocessConfig)
+    cli_overrides = _convert_argparse_style_to_cli(raw_args)
+    try:
+        cli_conf = OmegaConf.from_cli(cli_overrides)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse command line arguments: {exc}") from exc
+
+    # Merge defaults with CLI to discover config path
+    merged_cfg: DictConfig = _safe_merge(default_cfg, cli_conf)
+    config_path = merged_cfg.get("config")
+
+    if config_path:
+        config_path = os.path.expanduser(config_path)
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
+        file_cfg = OmegaConf.load(config_path)
+        args: DictConfig = _safe_merge(default_cfg, file_cfg, cli_conf)
+    else:
+        args = merged_cfg
+
+    if OmegaConf.is_missing(args, "input_path") or not args.input_path:
+        raise ValueError("`input_path` must be provided via CLI or configuration file.")
+
+    allowed_pH_methods = {"all", "henderson_hasselbalch", "empirical", "molecular_properties"}
+    if args.pH_method not in allowed_pH_methods:
+        raise ValueError(f"Invalid pH_method '{args.pH_method}'. Choose from: {sorted(allowed_pH_methods)}")
+
+    if args.split is not None:
+        allowed_splits = {"random", "scaffold", "stratified"}
+        if args.split not in allowed_splits:
+            raise ValueError(f"Invalid split '{args.split}'. Choose from: {sorted(allowed_splits)}")
     
     # Create output directory if it doesn't exist
     if not os.path.exists(args.output_path):
