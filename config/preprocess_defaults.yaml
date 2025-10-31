@@ -1,0 +1,31 @@
+# Default configuration for the hits-preprocess pipeline.
+# Update `input_path` to point to your K-MELLODDY standard dataset before running.
+input_path: ./input_data/data_sample.csv
+
+# General output options
+output_path: ./processed_data
+gist_output: null
+to_gist_matrix: false
+
+# Processing toggles
+visualize: false
+parallel: false
+scale_activity: true
+convert_units: true
+
+# pH correction
+correct_pH: false
+pH_method: all  # one of [all, henderson_hasselbalch, empirical, molecular_properties]
+target_pH: 7.4
+
+# Splitting configuration
+split: null      # one of [random, scaffold, stratified]; null skips splitting
+test_size: 0.2
+valid_size: 0.1
+
+# Column names
+activity_col: Measurement_Value
+smiles_col: SMILES_Structure_Parent
+
+# Logging
+debug: false
