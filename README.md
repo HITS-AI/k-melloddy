@@ -65,6 +65,8 @@ This repository will be updated when the K-MELLODDY standard data format is chan
   - Ensures valid filenames across different operating systems.
 - **Customizable Parameters**:
   - Command-line interface for all major options.
+  - OmegaConf-backed configuration files with CLI overrides for reproducible runs.
+  - Offline-friendly manual endpoint mapping fallback when LLM APIs are unavailable.
   - Options to retain stereochemistry, remove salts, detect outliers, and handle duplicates.
   - **NEW**: Export to GIST matrix (SMILES × GIST endpoints) via `--to-gist-matrix`
 
@@ -76,6 +78,11 @@ This pipeline can convert K-MELLODDY standard data into a GIST matrix where rows
 - For ADMET data, duplicate records per SMILES/endpoints are averaged.
 - For PK (patient-origin) data, duplicate rows per SMILES are kept, and output filename includes `_PK`.
 - Missing values are filled with 0. Metadata JSON is saved alongside the CSV.
+
+### Endpoint Mapping Modes
+- `llm`: Uses `llm_converter/src/format_converter.py` with LangChain + Gemini/OpenAI (requires `GEMINI_API_KEY`).
+- `manual`: Uses `llm_converter/src/manual_converter.py`, a synonym/similarity-based mapper that runs fully offline.
+- When `endpoint_mapper` is set to `llm` but credentials or dependencies are missing, the pipeline automatically falls back to `manual` and records the strategy in metadata.
 
 ### Requirements for LLM mapping
 Set the following environment variables before running:
@@ -120,12 +127,25 @@ Generated files:
 ## Usage
 ### Command Line Usage
 ```bash
-python hits-preprocess.py --input_path input_data/data_sample.csv --output_path ./processed_data --visualize True --parallel True --split scaffold --activity_col "Measurement_Value"
+python hits-preprocess.py \
+  --config config/preprocess_defaults.yaml \
+  --input_path input_data/data_sample.csv \
+  --split scaffold \
+  --visualize true \
+  --parallel true
 ```
+
+### Configuration (OmegaConf)
+- The script loads defaults from `config/preprocess_defaults.yaml`. Copy and modify this file for project-specific presets.
+- Pass `--config path/to/your_config.yaml` (or `config=...`) to load another YAML file. Subsequent CLI flags override the file values.
+- Arguments still accept `--flag value` syntax; boolean flags can be toggled with `--flag true/false` or `flag=true`.
+- To run without a config file, omit `--config` and supply all necessary options on the command line; `--input_path` remains required.
+- Choose the endpoint mapping mode via `endpoint_mapper` (`llm` or `manual`); manual mode needs no API key and supports optional custom synonym files.
 
 ### Key Command Line Arguments
 | Argument | Description |
 |----------|-------------|
+| `--config` | Path to a YAML config file (e.g. `config/preprocess_defaults.yaml`) |
 | `--input_path` | Path to the input file (CSV or Excel) (required) |
 | `--output_path` | Directory to save processed data (default: ./processed_data) |
 | `--visualize` | Generate visualizations (True/False) |
@@ -135,6 +155,10 @@ python hits-preprocess.py --input_path input_data/data_sample.csv --output_path 
 | `--correct_pH` | Correct pH-dependent activity values (True/False) |
 | `--pH_method` | pH correction method (all, henderson_hasselbalch, empirical, molecular_properties) |
 | `--target_pH` | Target pH for correction (default: 7.4) |
+| `--endpoint_mapper` | Endpoint mapping mode (`llm` or `manual`, default: `llm`) |
+| `--manual_mapping_path` | Optional CSV/JSON for additional manual endpoint synonyms |
+| `--manual_min_similarity` | Minimum similarity threshold for manual mapping (default: 0.55) |
+| `--manual_prefer_exact` | Prefer exact synonym hits before similarity (True/False) |
 | `--split` | Data splitting method (random, scaffold, stratified) |
 | `--test_size` | Test set size (default: 0.2) |
 | `--valid_size` | Validation set size (default: 0.1) |
@@ -234,6 +258,7 @@ Implements data splitting methods for preparing machine learning datasets.
 - `multiprocessing`
 - `openpyxl` (for Excel file support)
 - `pint` (for unit conversion)
+- `omegaconf` (for YAML/CLI configuration management)
   
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
