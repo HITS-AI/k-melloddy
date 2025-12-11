@@ -36,6 +36,8 @@ This repository will be updated when the K-MELLODDY standard data format is chan
   - Preserves Chemical ID information throughout the processing pipeline.
   - **NEW**: Special handling for Pharmacokinetics data - preserves duplicate compounds with different measurements.
   - **NEW**: Improved duplicate handling for all data types, with fallback to keep='first' strategy if all data would be removed.
+  - **NEW**: Automatic duplicate column removal to prevent groupby errors.
+  - **NEW**: Path traversal protection for secure file loading.
 - **Special Character Handling**:
   - **NEW**: Automatically replaces special characters (μ, °, α, β, etc.) with their ASCII equivalents to prevent encoding issues.
   - Ensures data compatibility across different systems and software.
@@ -66,62 +68,108 @@ This repository will be updated when the K-MELLODDY standard data format is chan
 - **Customizable Parameters**:
   - Command-line interface for all major options.
   - OmegaConf-backed configuration files with CLI overrides for reproducible runs.
-  - Offline-friendly manual endpoint mapping fallback when LLM APIs are unavailable.
+  - Offline-friendly manual endpoint mapping (default mode, no API required).
   - Options to retain stereochemistry, remove salts, detect outliers, and handle duplicates.
   - **NEW**: Export to GIST matrix (SMILES × GIST endpoints) via `--to-gist-matrix`
+  - **NEW**: Python API functions (`preprocess_dataframe`, `preprocess_to_gist`) for programmatic use
+  - **NEW**: Configurable missing data handling (NaN vs 0) via `fill_missing` parameter
 
-## New: GIST Matrix Export (LLM-assisted)
-This pipeline can convert K-MELLODDY standard data into a GIST matrix where rows are SMILES and columns are GIST endpoints.
+## GIST Matrix Export
+This pipeline can convert K-MELLODDY standard data into a GIST format matrix where rows are SMILES and columns are standardized GIST endpoints.
 
-- Endpoint matching is performed by an LLM (Gemini via LangChain) using domain-specific prompts.
-- Units are converted to SI using the built-in `UnitConverter`.
-- For ADMET data, duplicate records per SMILES/endpoints are averaged.
-- For PK (patient-origin) data, duplicate rows per SMILES are kept, and output filename includes `_PK`.
-- Missing values are filled with 0. Metadata JSON is saved alongside the CSV.
+### Key Features
+- **Integrated Endpoint Mapping**: Rule-based endpoint matching with 100+ predefined synonyms (fully offline, no API required)
+- **Three-Tier Matching Strategy**:
+  1. **Exact Match**: Direct lookup in synonym dictionary
+  2. **Substring Match**: Prioritizes longer, more specific matches
+  3. **Similarity Match**: Token overlap and sequence similarity (with special handling for CYP endpoints)
+- **CYP Endpoint Protection**: Prevents false positives (e.g., CYP2C9 ↔ CYP2D6) by requiring exact CYP number matches
+- **SI Unit Conversion**: Automatically converts units to SI using the built-in `UnitConverter`
+- **Missing Data Handling**: Uses `NaN` by default to distinguish between actual zero measurements and missing data (configurable via `fill_missing` parameter)
+- **PK Data Support**: For PK (patient-origin) data, duplicate rows per SMILES are preserved with aggregated measurements
+- **Column Normalization**: Automatic case-insensitive column name normalization for backward compatibility
 
 ### Endpoint Mapping Modes
-- `llm`: Uses `llm_converter/src/format_converter.py` with LangChain + Gemini/OpenAI (requires `GEMINI_API_KEY`).
-- `manual`: Uses `llm_converter/src/manual_converter.py`, a synonym/similarity-based mapper that runs fully offline.
-- When `endpoint_mapper` is set to `llm` but credentials or dependencies are missing, the pipeline automatically falls back to `manual` and records the strategy in metadata.
-
-### Requirements for LLM mapping
-Set the following environment variables before running:
-
-```bash
-export GEMINI_API_KEY="<your_gemini_api_key>"
-export LLM_MODEL="gemini-1.5-flash"
-export LLM_TEMPERATURE="0.1"
-export LLM_SOURCE="Gemini"
-```
+- **`manual`** (default): Uses integrated `ManualFormatConverter` with rule-based matching. Fully offline, no API keys required.
+  - 100+ predefined endpoint synonyms covering major ADMET categories
+  - Custom mapping files (CSV/JSON) can be provided via `manual_mapping_path`
+  - Configurable similarity threshold (`manual_min_similarity`, default: 0.55)
+- **`llm`** (optional): Uses `llm_converter/src/format_converter.py` with LangChain + Gemini/OpenAI (requires API keys)
+  - Automatically falls back to `manual` mode if credentials or dependencies are missing
 
 ### GIST Endpoint List
-The list of GIST endpoints (columns) is read from `K-MELLODDY/gist/gist_format.txt` (first line, tab-separated).
+The list of GIST endpoints is hardcoded in `data.py` (no external file dependency). Includes 70+ standardized endpoints covering:
+- Permeability (Caco2, PAMPA, HIA, BBB, etc.)
+- Transporters (P-gp, BCRP, OATP, MATE, OCT2)
+- CYPs (CYP1A2, CYP2B6, CYP2C9, CYP2C19, CYP2D6, CYP3A4 as Inhibitor/Substrate)
+- Metabolism (HLM, RLM, HLC_Stability, Clearance)
+- Toxicity (hERG, AMES, DILI, ClinTox, Micronucleus, etc.)
+- Nuclear Receptors (NR-AhR, NR-AR, NR-ER, etc.)
 
 ### Usage
-Run from the `K-MELLODDY` directory:
 
+#### Using Command Line Interface
 ```bash
 conda activate goldilocks
 python hits-preprocess.py \
   --input_path input_data/Des_43404_PAMPA_Caco-2_MDCK_250829.xlsx \
   --output_path . \
   --to-gist-matrix \
+  --endpoint_mapper manual \
+  --fill_missing false \
   --debug
 ```
 
-Generated files:
-- `*_gist_matrix.csv` (or `*_PK_gist_matrix.csv` if PK rows detected)
-- Corresponding `*_gist_matrix_metadata.json`
+#### Using Python API
+```python
+from data import preprocess_dataframe, preprocess_to_gist
+import pandas as pd
+
+# Step 1: Preprocess long format data
+df = pd.read_excel('input_data.xlsx')
+preprocessed_df = preprocess_dataframe(
+    df=df,
+    task_type='regression',
+    task='permeability',
+    smiles_column='smiles_structure_parent',
+    activity_column='measurement_value',
+    convert_units=True,
+    correct_pH=True
+)
+
+# Step 2: Convert to GIST format
+gist_matrix = preprocess_to_gist(
+    input_data=preprocessed_df,
+    skip_preprocessing=True,  # Already preprocessed
+    endpoint_mapper='manual',
+    fill_missing=False,  # Use NaN for missing values
+    manual_min_similarity=0.55
+)
+
+# Save result
+gist_matrix.to_csv('output_gist_matrix.csv', index=False)
+```
+
+### Generated Files
+- `*_gist_matrix.csv`: GIST format matrix (SMILES × GIST endpoints)
+- `*_PK_gist_matrix.csv`: If PK rows detected (includes aggregated measurements)
+- Corresponding `*_gist_matrix_metadata.json`: Processing metadata (if using CLI)
 
 ## Installation
 1. Clone the repository:
    ```bash
    git clone https://github.com/HITS-AI/k-melloddy.git
-   cd k-melloddy
+   cd K-MELLODDY
    ```
-2. Install the required dependencies: (will be added soon)
+2. Install the required dependencies:
    ```bash
    pip install -r requirements.txt
+   ```
+   
+   For LLM endpoint mapping (optional):
+   ```bash
+   # Set environment variables (see GIST Matrix Export section)
+   export GEMINI_API_KEY="<your_gemini_api_key>"
    ```
 
 ## Usage
@@ -155,15 +203,18 @@ python hits-preprocess.py \
 | `--correct_pH` | Correct pH-dependent activity values (True/False) |
 | `--pH_method` | pH correction method (all, henderson_hasselbalch, empirical, molecular_properties) |
 | `--target_pH` | Target pH for correction (default: 7.4) |
-| `--endpoint_mapper` | Endpoint mapping mode (`llm` or `manual`, default: `llm`) |
+| `--to-gist-matrix` | Export to GIST format matrix (SMILES × GIST endpoints) |
+| `--endpoint_mapper` | Endpoint mapping mode (`llm` or `manual`, default: `manual`) |
 | `--manual_mapping_path` | Optional CSV/JSON for additional manual endpoint synonyms |
 | `--manual_min_similarity` | Minimum similarity threshold for manual mapping (default: 0.55) |
-| `--manual_prefer_exact` | Prefer exact synonym hits before similarity (True/False) |
+| `--manual_prefer_exact` | Prefer exact synonym hits before similarity (True/False, default: True) |
+| `--fill_missing` | Fill missing values with 0 instead of NaN (True/False, default: False) |
+| `--skip_preprocessing` | Skip DataInspector normalization (use with preprocessed data) |
 | `--split` | Data splitting method (random, scaffold, stratified) |
 | `--test_size` | Test set size (default: 0.2) |
 | `--valid_size` | Validation set size (default: 0.1) |
-| `--activity_col` | Name of activity value column (default: Measurement_Value) |
-| `--smiles_col` | Name of SMILES column (default: SMILES_Structure_Parent) |
+| `--activity_col` | Name of activity value column (default: measurement_value) |
+| `--smiles_col` | Name of SMILES column (default: smiles_structure_parent) |
 | `--debug` | Enable debug level logging |
 
 ### Output Structure
@@ -198,15 +249,18 @@ The pipeline supports two main file formats:
 > Note: The latest K-MELLODDY standard data format and sample files can be downloaded from the official forum: [forum.k-melloddy.com](https://forum.k-melloddy.com/).
 
 Required columns in both formats:
-- **SMILES Column**: Contains SMILES strings of compounds (default: `SMILES_Structure_Parent`).
-- **Activity Column**: Contains numeric or categorical activity values (default: `Measurement_Value`).
+- **SMILES Column**: Contains SMILES strings of compounds (default: `smiles_structure_parent`, case-insensitive matching supported).
+- **Activity Column**: Contains numeric or categorical activity values (default: `measurement_value`, case-insensitive matching supported).
 
 Optional but recommended columns:
-- **Test_Subject**: Identifies the test subject (e.g., human, rat). In new format, this may be labeled as 'Test_Subject*'.
+- **Test_Subject**: Identifies the test subject (e.g., human, rat). In new format, this may be labeled as 'Test_Subject*' (automatically normalized).
 - **Test_Dose**: Specifies dosage information (automatically included for Pharmacokinetics tests).
 - **Chemical_ID**: Compound identifier (will be included in molecule visualizations if present).
-- **Measurement_Unit**: Unit of measurement (e.g., μg/mL, μM, hours) for unit conversion to SI units.
-- **pH-related columns**: pH value column (e.g., pH, pH_Value, Measurement_pH) for pH correction when Test_Type contains 'pH'.
+- **Measurement_Unit**: Unit of measurement (e.g., μg/mL, μM, hours) for unit conversion to SI units. Creates `measurement_value_si` and `measurement_unit_si` columns.
+- **pH-related columns**: pH value column (e.g., pH, pH_Value, Measurement_pH) for pH correction when Test_Type contains 'pH'. **NEW**: pH can be automatically inferred from Test_Type if pH column is missing.
+- **Test**: Test identifier (e.g., 'Pharmacokinetics', 'ADMET').
+- **Test_Type**: Type of test (e.g., 'pH4.0', 'pH 7.4').
+- **Measurement_Type**: Type of measurement.
 
 **NEW**: Additional columns in new K-MELLODDY format:
 - **Measurement_Conc**: Concentration information for measurements.
@@ -228,37 +282,95 @@ The pipeline enforces the following training quorum requirements:
 - **Classification tasks**: At least 25 active and 25 inactive samples per task.
 - **Regression tasks**: At least 50 total data points with at least 25 uncensored data points per task.
 
-## Classes
-### DataInspector
+## Classes and Functions
+
+### Main Functions
+
+#### `preprocess_dataframe(df, task_type, task, ...)`
+Preprocesses long format data (one measurement per row) using the `Preprocessor` class.
+
+**Parameters:**
+- `df`: Input DataFrame in long format
+- `task_type`: 'classification' or 'regression'
+- `task`: Task identifier
+- `smiles_column`: SMILES column name (default: 'smiles_structure_parent')
+- `activity_column`: Activity column name (default: 'measurement_value')
+- `convert_units`: Convert units to SI (default: True)
+- `correct_pH`: Apply pH correction (default: True)
+- Additional Preprocessor parameters
+
+**Returns:** Preprocessed DataFrame with standardized SMILES and processed labels
+
+#### `preprocess_to_gist(input_data, ...)`
+Converts input data (CSV path or DataFrame) to GIST format matrix.
+
+**Parameters:**
+- `input_data`: CSV file path (str) or DataFrame (can be preprocessed by `preprocess_dataframe`)
+- `endpoint_mapper`: 'llm' or 'manual' (default: 'manual')
+- `skip_preprocessing`: Skip DataInspector normalization if data is already preprocessed (default: False)
+- `fill_missing`: Fill missing values with 0 instead of NaN (default: False)
+- `manual_mapping_path`: Path to custom endpoint mapping CSV/JSON (optional)
+- `manual_min_similarity`: Minimum similarity for manual matching (default: 0.55)
+- Additional configuration options
+
+**Returns:** GIST format matrix (DataFrame with SMILES as rows and GIST endpoints as columns)
+
+### Classes
+
+#### `DataInspector`
 Examines the input data, validates training quorum requirements, and organizes data by test groups.
+- **NEW**: Automatic column name normalization (case-insensitive)
+- **NEW**: Duplicate column removal
+- **NEW**: Path traversal protection
+- **NEW**: Support for multiple Excel sheets (ADMET, PK, 데이터)
 
-### Preprocessor
+#### `Preprocessor`
 Handles chemical standardization, outlier detection, label preprocessing, and unit conversion.
+- **NEW**: Improved duplicate handling with fallback strategy
+- **NEW**: Automatic SI unit conversion re-run on DataFrame restoration
+- **NEW**: Enhanced error handling for edge cases
 
-### UnitConverter
+#### `UnitConverter`
 Converts measurement units to SI units using the pint package, supporting common chemical/pharmaceutical units.
+- Creates new columns with `_si` suffix (e.g., `measurement_value_si`, `measurement_unit_si`)
+- Handles comparison operators (>, <) in measurement values
 
-### pHCorrector
+#### `pHCorrector`
 Corrects pH-dependent activity values using three methods: Henderson-Hasselbalch equation, empirical correction, and molecular properties-based correction.
+- **NEW**: Automatic pH inference from Test_Type column when pH column is missing
 
-### DataVisualizer
+#### `ManualFormatConverter`
+Rule-based endpoint mapper (integrated from `manual_converter.py`).
+- **NEW**: 100+ predefined endpoint synonyms
+- **NEW**: Three-tier matching strategy (exact → substring → similarity)
+- **NEW**: Special CYP endpoint protection (prevents false positives)
+- **NEW**: Configurable similarity threshold and exact match preference
+- Supports custom mapping files (CSV/JSON)
+
+#### `DataVisualizer`
 Provides visualization tools for molecular structures, activity distributions, and scaffold diversity.
 
-### DataSplitter
+#### `DataSplitter`
 Implements data splitting methods for preparing machine learning datasets.
 
 ## Dependencies
-- `pandas`
-- `numpy`
-- `rdkit`
-- `scikit-learn`
-- `scipy`
-- `matplotlib`
-- `seaborn`
-- `multiprocessing`
-- `openpyxl` (for Excel file support)
-- `pint` (for unit conversion)
-- `omegaconf` (for YAML/CLI configuration management)
+- `pandas>=2.2.3`
+- `numpy>=2.2.6`
+- `rdkit>=2025.3.2`
+- `scikit-learn>=1.6.1`
+- `scipy>=1.15.3`
+- `matplotlib>=3.10.3`
+- `seaborn>=0.13.2`
+- `openpyxl>=3.0.0` (for Excel file support)
+- `pint>=0.19.0` (for unit conversion)
+- `omegaconf>=2.3.0` (for YAML/CLI configuration management)
+
+### Optional Dependencies (for LLM endpoint mapping)
+- `langchain>=0.1.0`
+- `langchain-openai>=0.1.0`
+- `langchain-core>=0.1.0`
+
+> **Note**: LLM endpoint mapping is optional. The default `manual` mode works fully offline without any API keys.
   
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
