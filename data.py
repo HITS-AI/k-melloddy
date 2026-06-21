@@ -1208,7 +1208,7 @@ class DataInspector:
 			except Exception:
 				pass
 		for col in df.columns:
-			if df[col].dtype == 'object':
+			if df[col].dtype == 'object' or pd.api.types.is_string_dtype(df[col].dtype):
 				df[col] = df[col].astype(str).str.replace('μ', 'u')
 				df[col] = df[col].apply(lambda x: self._replace_special_chars(x) if isinstance(x, str) else x)
 		df = self.normalize_column_names(df)
@@ -1322,7 +1322,7 @@ class DataInspector:
 			except Exception:
 				pass
 		for col in df.columns:
-			if df[col].dtype == 'object':
+			if df[col].dtype == 'object' or pd.api.types.is_string_dtype(df[col].dtype):
 				df[col] = df[col].astype(str).str.replace('μ', 'u')
 				df[col] = df[col].apply(lambda x: self._replace_special_chars(x) if isinstance(x, str) else x)
 		df = self.normalize_column_names(df)
