@@ -1113,7 +1113,7 @@ class DataInspector:
 
         # Replace special characters in column values
         for col in df.columns:
-            if df[col].dtype == 'object':  # Only process string columns
+            if df[col].dtype == 'object' or pd.api.types.is_string_dtype(df[col].dtype):  # Only process string columns
                 # Replace μ (micro) with u
                 df[col] = df[col].astype(str).str.replace('μ', 'u')
                 # Replace other potentially problematic unicode characters
