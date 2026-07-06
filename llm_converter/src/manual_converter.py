@@ -48,7 +48,12 @@ DEFAULT_ENDPOINT_SYNONYMS: Dict[str, str] = {
     "pgp substrate": "pgp_substrate",
     "p-gp substrate": "pgp_substrate",
     "p-gp inhibitor": "pgp_inhibitor",
+    "p-gp": "pgp_inhibitor",
+    "p_gp": "pgp_inhibitor",
     "bcrp inhibitor": "BCRP",
+    "bcrp": "BCRP",
+    "efflux ratio": "Efflux_ratio",
+    "efflux_ratio": "Efflux_ratio",
     "oatp1b1": "OATP1B1_Inhibitor",
     "oatp1b3": "OATP1B3_Inhibitor",
     "oatp2b1": "OATP2B1_Inhibitor",
@@ -85,6 +90,14 @@ DEFAULT_ENDPOINT_SYNONYMS: Dict[str, str] = {
     "skin irritation": "Skin Reaction",
     "micronucleus": "Micronucleus",
     "fdamdd": "FDAMDD(reg)",
+    # Solubility & lipophilicity
+    "solubility": "Solubility",
+    "lipophilicity": "Lipophilicity",
+    "logp": "Lipophilicity",
+    "log p": "Lipophilicity",
+    "clogp": "Lipophilicity",
+    "alogp": "Lipophilicity",
+    "logd": "Lipophilicity",
     # Misc
     "plasma protein binding": "PPBR",
     "ppb": "PPBR",
@@ -117,9 +130,19 @@ class ManualConversionConfig:
 class ManualFormatConverter:
     """Endpoint converter using deterministic heuristics."""
 
+    # CYP isoforms that actually have a GIST column (as *_Inhibitor / *_Substrate).
+    # CYP1A1 and CYP2C8 appear in v4.6 data but have NO GIST slot, so they must be
+    # left unmapped rather than bleeding into a neighbouring isoform via similarity.
+    CYP_GIST_ISOFORMS = frozenset({"cyp1a2", "cyp2b6", "cyp2c9", "cyp2c19", "cyp2d6", "cyp3a4"})
+
+    # Endpoints present in v4.6 but with NO GIST column: never force-map them via
+    # token/similarity (they belong in the *_unmapped.csv report instead).
+    UNMAPPABLE_TOKENS = frozenset({"cytotoxicity", "genetoxicity"})
+
     def __init__(self, config: Optional[ManualConversionConfig] = None):
         self.config = config or ManualConversionConfig()
         self.gist_endpoints = self._load_gist_endpoints()
+        self._gist_set = set(self.gist_endpoints)
         self._normalized_gist = {
             endpoint: self._normalize(endpoint) for endpoint in self.gist_endpoints
         }
@@ -227,6 +250,35 @@ class ManualFormatConverter:
 
         return None
 
+    @staticmethod
+    def _contiguous_index(key_tokens: Tuple[str, ...], tokens: Tuple[str, ...]) -> int:
+        """Return the start index of key_tokens as a contiguous sublist of tokens,
+        or -1 if absent. Word-boundary matching (a whole-token sequence), so short
+        keys like 'tr'/'gr' no longer substring-match inside 'transporter'."""
+        n, m = len(tokens), len(key_tokens)
+        if m == 0 or m > n:
+            return -1
+        for i in range(n - m + 1):
+            if tokens[i:i + m] == key_tokens:
+                return i
+        return -1
+
+    def _cyp_guard(self, normalized: str) -> Optional[str]:
+        """Map CYP endpoints to their exact GIST isoform column, never a neighbour.
+
+        Returns a GIST column name, the sentinel '' (CYP endpoint with no GIST
+        slot -> leave unmapped), or None (not a CYP endpoint)."""
+        isoforms = re.findall(r"cyp\d+[a-z]\d*", normalized)
+        if not isoforms:
+            return None
+        iso = isoforms[0]  # CYP3A4_MDZ / CYP3A4_TST both collapse to 'cyp3a4' here
+        role = "Substrate" if "substrate" in normalized else "Inhibitor"
+        if iso in self.CYP_GIST_ISOFORMS:
+            target = f"{iso.upper()}_{role}"
+            if target in self._gist_set:
+                return target
+        return ""  # CYP1A1 / CYP2C8 etc.: no GIST slot -> unmapped
+
     def match_endpoint(self, endpoint: Any) -> str:
         normalized = self._normalize(endpoint)
         if not normalized:
@@ -234,16 +286,33 @@ class ManualFormatConverter:
 
         tokens = self._tokenize(normalized)
 
+        # CYP guard first: exact isoform only, no cross-isoform similarity bleed.
+        cyp = self._cyp_guard(normalized)
+        if cyp is not None:
+            return cyp if cyp else str(endpoint)
+
         # Direct synonym mapping
         if normalized in self.synonym_map:
             return self.synonym_map[normalized]
 
-        # Partial keyword lookup (token-level)
+        # Endpoints with no GIST slot: leave unmapped (do not force via similarity).
+        if any(tok in self.UNMAPPABLE_TOKENS for tok in tokens):
+            return str(endpoint)
+
+        # Partial keyword lookup via whole-token subsequence matching. Prefer the
+        # most specific match: longest key, then the one that starts latest (the
+        # Measurement_Type is the last, most-discriminating canonical component).
+        best = None  # (num_tokens, start_index, mapped)
         for synonym_key, mapped in self.synonym_map.items():
-            if self.config.prefer_exact and synonym_key == normalized:
-                return mapped
-            if synonym_key in normalized:
-                return mapped
+            key_tokens = tuple(synonym_key.split())
+            idx = self._contiguous_index(key_tokens, tokens)
+            if idx < 0:
+                continue
+            cand = (len(key_tokens), idx, mapped)
+            if best is None or cand[:2] > best[:2]:
+                best = cand
+        if best is not None:
+            return best[2]
 
         # Similarity fallback
         matched = self._match_with_similarity(normalized, tokens)
