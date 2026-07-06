@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from omegaconf import OmegaConf, DictConfig, MISSING
 from omegaconf.errors import ConfigKeyError, ValidationError
 from rdkit import Chem
-from rdkit.Chem import SaltRemover, MolStandardize, Draw
+from rdkit.Chem import SaltRemover, MolStandardize, Draw, Descriptors
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.cluster import DBSCAN
 from sklearn.mixture import GaussianMixture
@@ -193,7 +193,7 @@ def recognize_task_type(each_df, activity_col='Measurement_Value'):
     # Check if all values can be converted to numbers
     try:
         # Try to convert to numeric, excluding comparison operators (>, <)
-        numeric_values = pd.to_numeric(each_df[activity_col].astype(str).str.replace(r'^[<>]\s*', '', regex=True), errors='coerce')
+        numeric_values = pd.to_numeric(each_df[activity_col].astype(str).str.replace(r'^[<>]=?\s*', '', regex=True), errors='coerce')
         if numeric_values.isna().sum() > 0:
             # If values that can't be converted to numbers exist, it's a classification task
             return "classification"
@@ -319,6 +319,23 @@ class UnitConverter:
             'a': 'angstrom',
         }
         
+        # v4.6 compound units (keyed by lowercased, whitespace-stripped form after
+        # '·'->'*' and '^'->'**') mapped to pint-parseable strings.
+        self.compound_unit_mappings = {
+            'ng*h/ml': 'ng*hour/mL', 'ng*hr/ml': 'ng*hour/mL', 'ng*hour/ml': 'ng*hour/mL',
+            'ug*h/ml': 'ug*hour/mL', 'mg*h/ml': 'mg*hour/mL',
+            'l/hr/kg': 'L/hour/kg', 'l/h/kg': 'L/hour/kg', 'ml/min/kg': 'mL/minute/kg',
+            'ul/min/mg': 'uL/minute/mg', 'ml/min/mg': 'mL/minute/mg',
+            'min-1': '1/minute', 'hr-1': '1/hour', 'h-1': '1/hour', 's-1': '1/second',
+        }
+
+        # Reporting/dimensionless units whose numeric value must NOT be rescaled
+        # (leaving them to pint would e.g. turn 10-6 cm/s into a ~1e8x corruption,
+        # or 50% into 0.5). Kept verbatim with an explicit label.
+        self.keep_as_is_units = {
+            '1e-6 cm/s', 'ratio', 'fold', 'percent', 'dimensionless', 'x',
+        }
+
         # SI unit targets for different measurement types
         self.si_targets = {
             'concentration': 'M',  # Molar (mol/L)
@@ -334,23 +351,58 @@ class UnitConverter:
     
     def normalize_unit_string(self, unit_str):
         """
-        Normalize unit string to standard format
+        Normalize a unit string to a pint-parseable (or keep-as-is) form.
+
+        Unlike the old implementation this PRESERVES '.', '-', '*', '^', '/' and
+        '·' so composite/exponent units survive (e.g. '10-6 cm/s', 'ng·h/mL',
+        'min-1'). Returns None for blank/placeholder units.
         """
-        if not unit_str or pd.isna(unit_str) or unit_str == "Not specified":
+        if unit_str is None or (isinstance(unit_str, float) and pd.isna(unit_str)):
             return None
-            
-        # Convert to string and clean up
-        unit_str = str(unit_str).strip().lower()
-        
-        # Remove extra spaces and special characters
-        unit_str = re.sub(r'\s+', '', unit_str)
-        unit_str = re.sub(r'[^\w/%]', '', unit_str)
-        
-        # Map to standard format
-        if unit_str in self.unit_mappings:
-            return self.unit_mappings[unit_str]
-        
-        return unit_str
+        u = str(unit_str).strip()
+        if u in ('', '-', 'Not specified', 'nan', 'NaN', 'None'):
+            return None
+
+        # Molar concentrations are CASE-SENSITIVE: uM/nM/mM/pM/M mean molar, not
+        # length (um=micrometre). Resolve them before lowercasing collapses the M.
+        molar = re.fullmatch(r'([munp]?)M', u.replace(' ', ''))
+        if molar:
+            return {'u': 'uM', 'm': 'mM', 'n': 'nM', 'p': 'pM', '': 'M'}[molar.group(1)]
+
+        low = u.lower()
+        low = low.replace('·', '*').replace('×', '*').replace('•', '*')
+        low = re.sub(r'\s+', '', low)
+
+        # Permeability reporting unit: '10-6 cm/s', '10^-6 cm/s', 'x10-6 cm/s', ...
+        if re.fullmatch(r'(x)?10\^?-6cm/s(ec)?', low):
+            return '1e-6 cm/s'
+
+        # Dimensionless / reporting units kept verbatim.
+        if low in ('ratio', 'fold', 'x'):
+            return low
+        if low in ('%', 'percent'):
+            return 'percent'
+
+        # First-order rate constants: 'min-1' -> '1/minute', etc.
+        m = re.fullmatch(r'([a-z]+)-1', low)
+        if m and m.group(1) in ('min', 'hr', 'h', 's', 'sec'):
+            base = {'min': 'minute', 'hr': 'hour', 'h': 'hour', 's': 'second', 'sec': 'second'}[m.group(1)]
+            return f'1/{base}'
+
+        # Units with non-pint tokens (e.g. 'uL/min/10^6 cells'): keep as-is.
+        if 'cell' in low:
+            return low
+
+        low = low.replace('^', '**')
+
+        # Compound v4.6 units first, then the simple table (both restore casing,
+        # e.g. 'um' -> 'uM' so micromolar is not read as micrometre).
+        if low in self.compound_unit_mappings:
+            return self.compound_unit_mappings[low]
+        if low in self.unit_mappings:
+            return self.unit_mappings[low]
+
+        return low
     
     def detect_measurement_type(self, unit_str):
         """
@@ -360,11 +412,20 @@ class UnitConverter:
             return 'unknown'
             
         unit_str = str(unit_str).lower()
-        
+
+        # Dimensionless / reporting units.
+        if unit_str in ('ratio', 'fold', '-', 'x', '%', 'percent') or 'cell' in unit_str:
+            return 'dimensionless'
+
+        # Rate / clearance units (per-time, possibly per-mass): check before the
+        # concentration/time heuristics so 'mL/min/kg' is not mislabelled.
+        if re.search(r'/\s*(min|hr|h|sec|s|day)\b', unit_str) or re.fullmatch(r'1/(min|hour|minute|s|second|hr|h)', unit_str):
+            return 'rate'
+
         # Concentration indicators
         if any(x in unit_str for x in ['/ml', '/l', 'm', 'mol']):
             return 'concentration'
-        
+
         # Time indicators
         if any(x in unit_str for x in ['hr', 'min', 'sec', 'day']):
             return 'time'
@@ -422,28 +483,28 @@ class UnitConverter:
             normalized_unit = self.normalize_unit_string(unit_str)
             if not normalized_unit:
                 return value, unit_str, unit_str
-            
+
+            # Reporting/dimensionless units: keep the numeric value unchanged so we
+            # never introduce a scale corruption (e.g. 10-6 cm/s, %, ratio, cells).
+            if normalized_unit in self.keep_as_is_units or 'cell' in normalized_unit:
+                return value, normalized_unit, unit_str
+
             # Create quantity with pint
             try:
                 quantity = value * self.ureg(normalized_unit)
-            except:
-                # Try with original unit string
-                try:
-                    quantity = value * self.ureg(unit_str)
-                except:
-                    logger.warning(f"Could not parse unit: {unit_str}. Returning original value.")
-                    return value, unit_str, unit_str
-            
+            except Exception:
+                logger.warning(
+                    f"Could not parse unit '{unit_str}' (normalized '{normalized_unit}'). "
+                    f"Keeping original value unconverted.")
+                return value, unit_str, unit_str
+
             # Convert to SI
             si_quantity = quantity.to_base_units()
-            
-            # Get SI unit string
             si_unit_str = str(si_quantity.units)
-            
             return float(si_quantity.magnitude), si_unit_str, unit_str
-            
+
         except Exception as e:
-            logger.warning(f"Error converting {value} {unit_str} to SI: {e}")
+            logger.warning(f"Error converting {value} {unit_str} to SI: {e}. Keeping original value.")
             return value, unit_str, unit_str
     
     def convert_column_to_si(self, df, value_col, unit_col, new_value_col=None, new_unit_col=None):
@@ -476,9 +537,11 @@ class UnitConverter:
         if new_unit_col is None:
             new_unit_col = f"{unit_col}_si"
         
-        # Initialize new columns
-        df[new_value_col] = df[value_col].copy()
-        df[new_unit_col] = df[unit_col].copy()
+        # Initialize new columns as object dtype so per-row float/str assignment
+        # works under pandas 3.0 (value_col is often cast to str upstream, and a
+        # str-dtype column rejects float assignment).
+        df[new_value_col] = df[value_col].astype(object)
+        df[new_unit_col] = df[unit_col].astype(object)
         
         # Track conversion statistics
         converted_count = 0
@@ -496,8 +559,8 @@ class UnitConverter:
                 # Try to convert to numeric if it's a string
                 try:
                     if isinstance(value, str):
-                        # Remove comparison operators if present
-                        value = re.sub(r'^[<>]\s*', '', value)
+                        # Remove comparison operators if present (>, >=, <, <=)
+                        value = re.sub(r'^[<>]=?\s*', '', value)
                         value = float(value)
                 except:
                     continue
@@ -909,9 +972,10 @@ class pHCorrector:
             }
             new_cols = [f"{activity_col}_pH_corrected_{method_suffix[self.method]}"]
         
-        # Initialize new columns
+        # Initialize new columns as object dtype so per-row float assignment works
+        # under pandas 3.0 (activity_col is often str-typed upstream).
         for col in new_cols:
-            df[col] = df[activity_col].copy()
+            df[col] = df[activity_col].astype(object)
         
         corrected_count = 0
         total_count = 0
@@ -1001,49 +1065,133 @@ def process_smiles_batch_global(smiles_batch):
     return results
 
 
+def _parse_bracket_numbers(cell):
+    """Parse a Permeability cell into a list of floats/None.
+
+    Accepts bracketed lists like '[6,2]', '[6,]', '[,2]', plain scalars '6.2',
+    or empty/placeholder values. An empty slot (e.g. the '' in '[6,]') becomes
+    None so directional presence is preserved.
+    """
+    if cell is None:
+        return []
+    s = str(cell).strip()
+    if s in ("", "-", "nan", "NaN", "None", "Not specified"):
+        return []
+    s = s.strip("[]")
+    if s == "":
+        return []
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if part == "":
+            out.append(None)
+            continue
+        part = re.sub(r'^[<>]=?\s*', '', part)  # tolerate leading comparators
+        try:
+            out.append(float(part))
+        except ValueError:
+            out.append(None)
+    return out
+
+
+def parse_permeability_pair(atob_cell, btoa_cell):
+    """Return (AtoB, BtoA) floats from the two Permeability value columns.
+
+    Handles the v4.6 '[Value, Value]=[AB, BA]' convention whether the pair is
+    split across the AtoB/BtoA columns or carried as a full list in either one.
+    Missing directions come back as None.
+    """
+    ab = _parse_bracket_numbers(atob_cell)
+    ba = _parse_bracket_numbers(btoa_cell)
+    atob = ab[0] if len(ab) >= 1 else None
+    btoa = ba[1] if len(ba) >= 2 else (ba[0] if len(ba) == 1 else None)
+    # Fall back to the other column if one carries the full [AB, BA] pair.
+    if atob is None and len(ba) >= 1:
+        atob = ba[0]
+    if btoa is None and len(ab) >= 2:
+        btoa = ab[1]
+    return atob, btoa
+
+
 class DataInspector:
     def __init__(self,
                  input_path:str,
                  smiles_column:str='SMILES_Structure_Parent',
                  activity_column:str='Measurement_Value',
-                 condition_columns:list=['Test', 'Test_Type', 'Test_Subject', 'Measurment_Type', 'Measurement_Conc', 'Measurement_Temp', 'Measurement_Class']
+                 condition_columns:list=['Test', 'Test_Type', 'Test_Subject', 'Measurement_Type', 'Measurement_Conc', 'Measurement_Temp', 'Measurement_Class', 'Measurement_Route', 'Measurement_Sex', 'Measurement_Formulation']
                  ):
         self.smiles_col = smiles_column
         self.activity_col = activity_column
         self.condition_columns = condition_columns
+        self.is_human_pk = False
         self.df = self.load_data(input_path)
     
+    # Canonical column names keyed by their normalized form (lowercased, trailing
+    # '*' and surrounding whitespace stripped). Covers the v4.6 spelling, the
+    # legacy 'Measurment_*' typo, the 'Test_Species' -> 'Test_Subject' rename, and
+    # VIVO's lowercase 'Measurement_value'. Case-insensitivity is what fixes B1/B4/H5.
+    CANONICAL_COLUMNS = {
+        'chemical id': 'Chemical ID',
+        'chemical name': 'Chemical Name',
+        'smiles_structure_parent': 'SMILES_Structure_Parent',
+        'smiles_salt': 'SMILES_Salt',
+        'test': 'Test',
+        'test_type': 'Test_Type',
+        'test_subject': 'Test_Subject',
+        'test_species': 'Test_Subject',          # legacy rename
+        'test_dose': 'Test_Dose',
+        'measurement_type': 'Measurement_Type',
+        'measurment_type': 'Measurement_Type',   # legacy typo
+        'measurement_relation': 'Measurement_Relation',
+        'measurment_relation': 'Measurement_Relation',
+        'measurement_value': 'Measurement_Value',
+        'measurment_value': 'Measurement_Value',
+        'measurement_value(atob)': 'Measurement_Value(AtoB)',
+        'measurement_value(btoa)': 'Measurement_Value(BtoA)',
+        'measurement_unit': 'Measurement_Unit',
+        'measurment_unit': 'Measurement_Unit',
+        'measurement_conc': 'Measurement_Conc',
+        'measurement_temp': 'Measurement_Temp',
+        'measurement_condition': 'Measurement_Condition',
+        'measurment_condition': 'Measurement_Condition',
+        'measurement_class': 'Measurement_Class',
+        'measurement_route': 'Measurement_Route',
+        'measurement_sex': 'Measurement_Sex',
+        'measurement_formulation': 'Measurement_Formulation',
+        'comment': 'Comment',
+    }
+
     def normalize_column_names(self, df):
         """
-        Normalize column names to handle both old and new K-MELLODDY formats.
-        Maps new format column names to old format for compatibility.
+        Normalize column names to canonical K-MELLODDY names.
+
+        Handles v4.6 (`Measurement_*`), the legacy typo (`Measurment_*`), the
+        `Test_Subject*`/`Test_Species` variants and VIVO's lowercase
+        `Measurement_value` via case-insensitive canonicalization. The real value
+        column is preserved; the legacy `Unnamed: 10` remap is applied only as a
+        fallback when no `Measurement_Value` is present (old merged-cell layout).
         """
-        # Remove the original Measurement_Value column that contains [Value] placeholders
-        if 'Measurement_Value' in df.columns:
-            df = df.drop(columns=['Measurement_Value'])
-        
-        column_mapping = {
-            # Handle Test_Subject variations
-            'Test_Subject*': 'Test_Subject',
-            
-            # Handle Measurement vs Measurment typos (only for old format)
-            # Note: New format uses correct spelling 'Measurement_*'
-            
-            # Map the actual data column in new format
-            'Unnamed: 10': 'Measurement_Value',  # This contains the actual measurement values
-            
-            # Handle new columns that don't exist in old format
-            'Measurement_Conc': 'Measurement_Conc',  # Keep as is for new features
-            'Measurement_Temp': 'Measurement_Temp',  # Keep as is for new features
-            'Measurement_Class': 'Measurement_Class',  # Keep as is for new features
-        }
-        
-        # Apply column mapping
-        df = df.rename(columns=column_mapping)
-        
-        # Remove any unnamed columns that might cause issues (except the one we mapped)
+        rename_map = {}
+        for col in df.columns:
+            key = str(col).strip().rstrip('*').strip().lower()
+            canonical = self.CANONICAL_COLUMNS.get(key)
+            if canonical and canonical != col:
+                rename_map[col] = canonical
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+        # Drop duplicate columns produced by renaming (keep the first occurrence).
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        # Legacy fallback: some old Excel exports carried the real numbers in an
+        # 'Unnamed: 10' column next to a placeholder value column. Only use it when
+        # a real Measurement_Value did not survive canonicalization.
+        if 'Measurement_Value' not in df.columns and 'Unnamed: 10' in df.columns:
+            df = df.rename(columns={'Unnamed: 10': 'Measurement_Value'})
+
+        # Remove any remaining unnamed columns.
         df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
-        
+
         logger.info(f"Normalized column names. Final columns: {df.columns.tolist()}")
         return df
     
@@ -1063,7 +1211,30 @@ class DataInspector:
             # Read both ADMET and PK sheets if they exist
             excel_file = pd.ExcelFile(input_path)
             sheets = excel_file.sheet_names
-            
+
+            # Human PK: wide-format, 3-row header (real header at row index 2),
+            # separate table sheets, and a non-GIST schema. Load the raw tables
+            # without ADMET-style normalization; the caller routes it to a
+            # separate output.
+            human_pk_sheets = [s for s in sheets
+                               if str(s).startswith('데이터') and 'human pk' in str(s).lower()]
+            if human_pk_sheets:
+                self.is_human_pk = True
+                logger.warning(
+                    "Human PK workbook detected (sheets: %s). Human PK is a "
+                    "wide-format, non-GIST schema; loading raw table without "
+                    "endpoint mapping.", ", ".join(human_pk_sheets))
+                hpk_dfs = [pd.read_excel(excel_file, sheet_name=s, header=2).fillna("Not specified")
+                           for s in human_pk_sheets]
+                df = pd.concat(hpk_dfs, ignore_index=True)
+                df = df.loc[:, ~df.columns.duplicated()]
+                df = self._map_human_pk_smiles(df)
+                for col in df.columns:
+                    if df[col].dtype == 'object' or pd.api.types.is_string_dtype(df[col].dtype):
+                        df[col] = df[col].astype(str).str.replace('μ', 'u')
+                        df[col] = df[col].apply(lambda x: self._replace_special_chars(x) if isinstance(x, str) else x)
+                return df
+
             dfs = []
             if 'ADMET' in sheets:
                 logger.info("Reading ADMET sheet")
@@ -1121,13 +1292,60 @@ class DataInspector:
                 
         # Normalize column names to handle both old and new formats
         df = self.normalize_column_names(df)
-        
+
+        # Permeability: split AtoB/BtoA list values into a usable value column.
+        df = self._expand_permeability_columns(df)
+
         # Ensure all condition columns exist
         for col in self.condition_columns:
             if col not in df.columns:
                 logger.warning(f"Condition column '{col}' not found in data. Creating empty column.")
                 df[col] = "Not specified"
-                
+
+        return df
+
+    def _map_human_pk_smiles(self, df):
+        """Rename the Human PK SMILES column (e.g. 'Substance\\n (약물, SMILES)')
+        to the canonical SMILES column so schema validation passes."""
+        if self.smiles_col in df.columns:
+            return df
+        for col in df.columns:
+            if 'smiles' in str(col).lower():
+                df = df.rename(columns={col: self.smiles_col})
+                logger.info(f"Human PK: mapped SMILES column '{col}' -> '{self.smiles_col}'.")
+                break
+        return df
+
+    def _expand_permeability_columns(self, df):
+        """Turn Permeability's ``Measurement_Value(AtoB)``/``(BtoA)`` list columns
+        into a scalar ``Measurement_Value`` (AtoB = the primary permeability value)
+        plus a ``Measurement_EffluxRatio`` helper (BtoA/AtoB) for GIST derivation.
+        """
+        ab_col, ba_col = 'Measurement_Value(AtoB)', 'Measurement_Value(BtoA)'
+        if ab_col not in df.columns and ba_col not in df.columns:
+            return df
+        atob_vals, btoa_vals, ratio_vals = [], [], []
+        for _, row in df.iterrows():
+            atob, btoa = parse_permeability_pair(row.get(ab_col), row.get(ba_col))
+            atob_vals.append(atob)
+            btoa_vals.append(btoa)
+            if atob not in (None, 0) and btoa is not None:
+                ratio_vals.append(btoa / atob)
+            else:
+                ratio_vals.append(None)
+        if 'Measurement_Value' not in df.columns:
+            df['Measurement_Value'] = atob_vals
+        else:
+            existing = df['Measurement_Value']
+            df['Measurement_Value'] = [
+                a if (pd.isna(e) or str(e) in ("", "Not specified")) else e
+                for e, a in zip(existing, atob_vals)
+            ]
+        df['Measurement_Value_BtoA'] = btoa_vals
+        df['Measurement_EffluxRatio'] = ratio_vals
+        n = sum(1 for v in atob_vals if v is not None)
+        logger.info(f"Permeability columns expanded: {n} AtoB values, "
+                    f"{sum(1 for v in ratio_vals if v is not None)} efflux ratios derived.")
         return df
     
     def _replace_special_chars(self, text):
@@ -1198,9 +1416,15 @@ class DataInspector:
             total_count = len(each_df)
             
             if 'Measurement_Relation' in each_df.columns:
-                uncensored_count = len(each_df[~each_df['Measurement_Relation'].isin(['>', '<'])])
+                # Censored = {>, >=, <, <=}. Equality is stored as the quoted
+                # literal '"="' in v4.6, so strip quotes before comparing; '=' and
+                # blanks count as uncensored.
+                rel_norm = (each_df['Measurement_Relation'].astype(str)
+                            .str.strip().str.strip('"').str.strip("'").str.strip())
+                censored_mask = rel_norm.isin(['>', '>=', '<', '<='])
+                uncensored_count = int((~censored_mask).sum())
             else:
-                has_relation_mask = each_df[self.activity_col].astype(str).str.contains('^[<>]')
+                has_relation_mask = each_df[self.activity_col].astype(str).str.contains(r'^[<>]=?')
                 uncensored_count = len(each_df[~has_relation_mask])
                 
             if total_count < 50 or uncensored_count < 25:
@@ -1583,8 +1807,16 @@ class Preprocessor:
             if self.detect_outliers:
                 self.detect_outlier_from_distribution()
                 
-            # Apply scaling (numeric only)
-            if np.issubdtype(labels.dtype, np.number) or labels.str.match(r'^[<>]?\s*\d+\.?\d*$').any():
+            # Apply scaling (numeric only). Use the pandas dtype API: under
+            # pandas 3.0 np.issubdtype(StringDtype, np.number) raises.
+            is_numeric = pd.api.types.is_numeric_dtype(labels)
+            has_numeric_strings = False
+            if not is_numeric:
+                try:
+                    has_numeric_strings = labels.astype(str).str.match(r'^[<>]?=?\s*\d+\.?\d*$').any()
+                except Exception:
+                    has_numeric_strings = False
+            if is_numeric or has_numeric_strings:
                 self.scale_experiment_values(labels)
             
             # Convert continuous values -> classification (using threshold)
@@ -1596,6 +1828,49 @@ class Preprocessor:
             # Add the base column to the final column list
             if self.activity_col not in self.final_cols:
                 self.final_cols.append(self.activity_col)
+
+    def _infer_ph_column(self):
+        """Infer a per-row pH value from v4.6 locations, in priority order:
+        dedicated pH columns, Test_Subject ('pH7.4'), Measurement_Condition
+        (bare number or 'pH x'), then Test_Type. Returns a float Series (NaN where
+        no pH is present)."""
+        ph_pattern = re.compile(r"pH\s*([0-9]+(?:\.[0-9]+)?)", flags=re.IGNORECASE)
+
+        def _ph_from_text(text):
+            m = ph_pattern.search(str(text))
+            if m:
+                try:
+                    return float(m.group(1))
+                except ValueError:
+                    return None
+            return None
+
+        def _bare_ph(text):
+            m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*", str(text))
+            if m:
+                try:
+                    v = float(m.group(1))
+                    if 0.0 <= v <= 14.0:
+                        return v
+                except ValueError:
+                    return None
+            return None
+
+        inferred = pd.Series(np.nan, index=self.df.index, dtype=float)
+        for col in ['pH', 'pH_Value', 'Measurement_pH', 'Test_pH']:
+            if col in self.df.columns:
+                inferred = inferred.combine_first(pd.to_numeric(self.df[col], errors='coerce'))
+        if 'Test_Subject' in self.df.columns:
+            inferred = inferred.combine_first(
+                pd.to_numeric(self.df['Test_Subject'].apply(_ph_from_text), errors='coerce'))
+        if 'Measurement_Condition' in self.df.columns:
+            mc = self.df['Measurement_Condition'].apply(
+                lambda x: _ph_from_text(x) if _ph_from_text(x) is not None else _bare_ph(x))
+            inferred = inferred.combine_first(pd.to_numeric(mc, errors='coerce'))
+        if 'Test_Type' in self.df.columns:
+            inferred = inferred.combine_first(
+                pd.to_numeric(self.df['Test_Type'].apply(_ph_from_text), errors='coerce'))
+        return inferred
 
     def preprocess(self):
         compounds = self.df[self.smiles_col]
@@ -1631,59 +1906,18 @@ class Preprocessor:
                 logger.info("Continuing without unit conversion")
         
         # Perform pH correction if enabled and pH-related data exists
-        if self.correct_pH and 'Test_Type' in self.df.columns:
-            # Check if any Test_Type contains 'pH'
-            pH_data_mask = self.df['Test_Type'].astype(str).str.contains('pH', case=False, na=False)
-            
+        if self.correct_pH:
+            # Build a unified pH source column from several v4.6 locations in
+            # priority order: dedicated pH columns -> Test_Subject ('pH7.4') ->
+            # Measurement_Condition (bare number or 'pH x') -> Test_Type embedded.
+            inferred_pH = self._infer_ph_column()
+            pH_data_mask = inferred_pH.notna()
+
             if pH_data_mask.any():
-                logger.info("pH-related data detected. Starting pH correction...")
+                logger.info(f"pH source detected for {int(pH_data_mask.sum())} rows. Starting pH correction...")
                 try:
-                    # Find pH column (could be named differently)
-                    pH_col = None
-                    possible_pH_cols = ['pH', 'pH_Value', 'Measurement_pH', 'Test_pH']
-                    for col in possible_pH_cols:
-                        if col in self.df.columns:
-                            pH_col = col
-                            break
-                    
-                    if pH_col is None:
-                        # Attempt to infer pH from Test_Type like "..._pH4.0" or strings containing "pH 4.0"
-                        inferred_col = 'inferred_pH'
-                        try:
-                            # Initialize with NaN
-                            self.df[inferred_col] = np.nan
-                            # Extract pH using regex; supports formats: pH4, pH4.0, pH 4.0
-                            # Also handles embedded tokens like "Solubility_pH4.0"
-                            pattern = re.compile(r"pH\s*([0-9]+(?:\.[0-9]+)?)", flags=re.IGNORECASE)
-                            def _extract_ph(text: Any) -> Optional[float]:
-                                s = str(text)
-                                m = pattern.search(s)
-                                if m:
-                                    try:
-                                        return float(m.group(1))
-                                    except Exception:
-                                        return None
-                                # Handle underscore-separated tokens ending with pH number (e.g., _pH4.0)
-                                # General fallback: split on non-alnum and look for tokens starting with 'ph'
-                                tokens = re.split(r"[^A-Za-z0-9\.]+", s)
-                                for tok in tokens:
-                                    if tok.lower().startswith('ph'):
-                                        num = tok[2:]
-                                        if num:
-                                            try:
-                                                return float(num)
-                                            except Exception:
-                                                continue
-                                return None
-                            # Apply only to pH-related rows
-                            self.df.loc[pH_data_mask, inferred_col] = self.df.loc[pH_data_mask, 'Test_Type'].apply(_extract_ph)
-                            if self.df.loc[pH_data_mask, inferred_col].notna().any():
-                                pH_col = inferred_col
-                                logger.info("Inferred pH values from Test_Type; proceeding with pH correction.")
-                            else:
-                                logger.warning("pH column not found and could not infer from Test_Type. pH correction will be skipped.")
-                        except Exception as infer_err:
-                            logger.warning(f"Failed to infer pH from Test_Type: {infer_err}. pH correction will be skipped.")
+                    self.df['inferred_pH'] = inferred_pH
+                    pH_col = 'inferred_pH'
                     if pH_col is not None:
                         logger.info(f"Using pH column: {pH_col}")
                         
@@ -1746,20 +1980,22 @@ class Preprocessor:
         if not self.keep_duplicates and not is_pk_data:
             # Record data count before duplicate removal
             before_count = len(self.df)
-            
+
+            # Keep a copy so we can recover WITHOUT losing enriched columns
+            # (_si, pH_corrected, Chemical ID) if the strict dedup empties the set.
+            df_before_dedup = self.df.copy()
+
             # Remove duplicates (remove all duplicates with keep=False)
             self.df.drop_duplicates(subset=["Standardized_SMILES"], keep=False, inplace=True, ignore_index=True)
-            
+
             # Record data count after duplicate removal
             after_count = len(self.df)
             if after_count == 0 and before_count > 0:
                 logger.warning(f"All data removed during duplicate removal! Original count: {before_count}")
-                # Try again with keep='first' to prevent complete data removal
-                self.df = pd.DataFrame(compounds).reset_index(drop=True)
-                self.df[self.activity_col] = labels.reset_index(drop=True)
-                self.preprocess_compounds(compounds)
-                self.preprocess_labels(labels)
-                self.df.drop_duplicates(subset=["Standardized_SMILES"], keep='first', inplace=True, ignore_index=True)
+                # Recover from the pre-dedup frame with keep='first' so all columns
+                # (including pH/SI-derived ones) survive.
+                self.df = df_before_dedup.drop_duplicates(
+                    subset=["Standardized_SMILES"], keep='first', ignore_index=True)
                 logger.info(f"Recovered {len(self.df)} records using keep='first' strategy")
             else:
                 logger.info(f"Removed {before_count - after_count} duplicate records. Remaining: {after_count}")
@@ -1774,8 +2010,14 @@ class Preprocessor:
             logger.error("Preprocessing resulted in empty dataset!")
         else:
             logger.info(f"Preprocessing completed. Final dataset contains {len(self.df)} records.")
-                
-        return self.df[self.final_cols]
+
+        # Select only columns that survived processing (dedup recovery paths can
+        # rebuild self.df and drop some expected columns); warn rather than crash.
+        existing_cols = [c for c in dict.fromkeys(self.final_cols) if c in self.df.columns]
+        missing_cols = [c for c in dict.fromkeys(self.final_cols) if c not in self.df.columns]
+        if missing_cols:
+            logger.warning(f"Output is missing {len(missing_cols)} expected column(s): {missing_cols}")
+        return self.df[existing_cols]
 
 class DataVisualizer:
     """
@@ -2306,6 +2548,22 @@ if __name__ == "__main__":
             )
             df = inspector.df.copy()
 
+            # Human PK is a wide-format, non-GIST schema: write it out separately
+            # instead of forcing it through endpoint mapping (which would yield an
+            # empty/garbage matrix).
+            if getattr(inspector, "is_human_pk", False):
+                base = os.path.splitext(os.path.basename(args.input_path))[0]
+                out_dir = "./processed_data"
+                os.makedirs(out_dir, exist_ok=True)
+                hpk_path = os.path.join(out_dir, f"{base}_HumanPK.csv")
+                df.to_csv(hpk_path, index=False)
+                logger.warning(
+                    "Human PK detected: wrote raw wide-format table to %s and "
+                    "skipped GIST matrix conversion (not a GIST-mappable schema).",
+                    hpk_path)
+                logger.info("Finished GIST matrix conversion")
+                sys.exit(0)
+
             # Normalize critical column names presence
             smiles_col = args.smiles_col if args.smiles_col in df.columns else "SMILES_Structure_Parent"
             unit_col = "Measurement_Unit" if "Measurement_Unit" in df.columns else None
@@ -2364,8 +2622,33 @@ if __name__ == "__main__":
             else:
                 value_col = args.activity_col
 
+            # H6: qualitative results (Ames/Genetoxicity) store Positive/Negative
+            # in Measurement_Unit with a '-' value. Encode as 1.0/0.0 before the
+            # numeric coercion so they are not dropped.
+            if "Measurement_Unit" in df.columns:
+                unit_lower = df["Measurement_Unit"].astype(str).str.strip().str.lower()
+                qual_mask = unit_lower.isin(["positive", "negative"])
+                if qual_mask.any():
+                    df.loc[qual_mask, value_col] = unit_lower[qual_mask].map(
+                        {"positive": 1.0, "negative": 0.0})
+                    logger.info(f"Encoded {int(qual_mask.sum())} qualitative "
+                                f"Positive/Negative results as 1/0.")
+
             # Ensure numeric type for aggregation (handle strings like '3.218e-05' or non-numeric leftovers)
             df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
+
+            # Permeability: derive Efflux_ratio (BtoA/AtoB) rows. The ratio is
+            # dimensionless (both directions share the unit) so it is injected
+            # directly without SI conversion.
+            if 'Measurement_EffluxRatio' in df.columns:
+                ratio_num = pd.to_numeric(df['Measurement_EffluxRatio'], errors='coerce')
+                er_mask = ratio_num.notna()
+                if er_mask.any():
+                    er = df.loc[er_mask].copy()
+                    er['gist_endpoint'] = 'Efflux_ratio'
+                    er[value_col] = ratio_num.loc[er_mask].values
+                    df = pd.concat([df, er], ignore_index=True)
+                    logger.info(f"Injected {int(er_mask.sum())} Efflux_ratio rows from Permeability BtoA/AtoB.")
 
             # Load GIST column list (tab-separated, first line)
             gist_file = os.path.join(os.path.dirname(__file__), "gist", "gist_format.txt")
@@ -2374,6 +2657,27 @@ if __name__ == "__main__":
             gist_cols = [c for c in first_line.split("\t") if c]
             if not gist_cols:
                 raise RuntimeError("GIST endpoint list is empty. Check gist_format.txt")
+
+            # M1/M2: rows whose endpoint has no GIST target would be silently
+            # dropped by the pivot. Instead report them and write to a separate
+            # *_unmapped.csv so the loss is visible (e.g. Cytotoxicity,
+            # Genetoxicity, pKa/MW, Phase-II metabolism, many VIVO params).
+            gist_set = set(gist_cols)
+            unmapped_mask = ~df["gist_endpoint"].isin(gist_set)
+            if unmapped_mask.any():
+                unmapped_df = df.loc[unmapped_mask]
+                counts = unmapped_df["endpoint_canonical"].value_counts()
+                logger.warning(
+                    "%d row(s) across %d endpoint(s) have no GIST target and are "
+                    "excluded from the matrix: %s",
+                    int(unmapped_mask.sum()), len(counts),
+                    ", ".join(f"{ep!r}x{int(n)}" for ep, n in counts.head(20).items()))
+                out_dir = "./processed_data"
+                os.makedirs(out_dir, exist_ok=True)
+                um_base = os.path.basename(args.input_path).split('.')[0]
+                um_path = os.path.join(out_dir, f"{um_base}_unmapped.csv")
+                unmapped_df.to_csv(um_path, index=False)
+                logger.warning("Wrote %d unmapped rows to %s", len(unmapped_df), um_path)
 
             # Detect PK rows (patient-origin) heuristics
             def is_pk_row(row: pd.Series) -> bool:
@@ -2487,7 +2791,19 @@ if __name__ == "__main__":
             smiles_column=args.smiles_col,
             activity_column=args.activity_col
         )
-        
+
+        # Human PK is a wide-format, non-GIST schema with no Test/Test_Type task
+        # grouping; write it out separately rather than crash in quorum grouping.
+        if getattr(inspector, "is_human_pk", False):
+            os.makedirs(args.output_path, exist_ok=True)
+            base = os.path.splitext(os.path.basename(args.input_path))[0]
+            hpk_path = os.path.join(args.output_path, f"{base}_HumanPK.csv")
+            inspector.df.to_csv(hpk_path, index=False)
+            logger.warning(
+                "Human PK detected: wrote raw wide-format table to %s and skipped "
+                "task-group processing (not a standard long-format schema).", hpk_path)
+            sys.exit(0)
+
         valid_groups = inspector.process()
         
         if len(valid_groups) < 1:

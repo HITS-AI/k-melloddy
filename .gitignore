@@ -172,3 +172,14 @@ input_data/Des_43404_PAMPA_Caco-2_MDCK_250829.xlsx
 processed_data/Des_43404_PAMPA_Caco-2_MDCK_250829_*
 processed_data/visualizations/Des_43404_PAMPA_Caco-2_MDCK_250829_*
 processed_data/splits/Des_43404_PAMPA_Caco-2_MDCK_250829_*
+
+# v4.6 rework: generated outputs and large/regenerable fixtures
+표준데이터포맷_v4.6.zip
+input_data/v46_fixtures/*.xlsx
+processed_data/*_gist_matrix*.csv
+processed_data/*_gist_matrix*.json
+processed_data/*_HumanPK.csv
+processed_data/*_unmapped.csv
+processed_data/*_processed.csv
+processed_data/splits/Solubility_data_*
+processed_data/splits/*_data_*

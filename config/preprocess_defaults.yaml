@@ -1,6 +1,6 @@
 # Default configuration for the hits-preprocess pipeline.
 # Update `input_path` to point to your K-MELLODDY standard dataset before running.
-input_path: ./forum_sample/71900_250327_Solubility_Solubility_pH4.0_Not_specified_Not_specified_processed.csv
+input_path: ./input_data/data_sample.csv
 
 # General output options
 output_path: ./processed_data
@@ -29,9 +29,9 @@ split: null      # one of [random, scaffold, stratified]; null skips splitting
 test_size: 0.2
 valid_size: 0.1
 
-# Column names
-activity_col: Measurement_Value_scaled
-smiles_col: Standardized_SMILES
+# Column names (raw-input defaults; the pipeline derives *_scaled / Standardized_SMILES).
+activity_col: Measurement_Value
+smiles_col: SMILES_Structure_Parent
 
 # Logging
 debug: false
