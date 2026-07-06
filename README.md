@@ -3,6 +3,19 @@
 This repository contains a Python-based preprocessing pipeline for K-MELLODDY standard data format, primarily designed for tasks in ADME/T prediction. The pipeline supports SMILES standardization, outlier detection, feature scaling, label creation, and now includes multiprocessing support, data visualization, and machine learning-ready data splitting. It is suitable for classification and regression tasks.
 This repository will be updated when the K-MELLODDY standard data format is changed.
 
+## K-MELLODDY Standard Format v4.6 Support
+The pipeline was updated to fully support the **v4.6** standard data format (previously only ~25–30% was covered, with most v4.6 files producing empty/all-zero matrices or crashes). Highlights of the v4.6 adaptation:
+
+- **Column-name normalization**: case-insensitive canonicalization of `Measurement_*` (incl. the legacy `Measurment_*` typo), `Test_Subject*` (asterisk), `Test_Species → Test_Subject`, and VIVO's lowercase `Measurement_value`. The value column is preserved (the old `Unnamed:10` hard-coding is gone).
+- **Permeability**: `Measurement_Value(AtoB)` / `(BtoA)` bracket-list values (`[6,2]`, `[6,]`, `[,2]`) are parsed; AtoB feeds `Caco2`/`PAMPA` and `Efflux_ratio` is derived as `BtoA/AtoB`.
+- **Human PK**: wide-format, 3-row-header workbooks (`데이터1/2(Human PK)`) are detected and written to a separate `*_HumanPK.csv` (not a GIST-mappable schema) instead of crashing.
+- **pH sources**: pH is inferred from `Test_Subject` (`pH7.4`), `Measurement_Condition` (bare number), and `Test_Type`, in addition to dedicated pH columns.
+- **Units**: composite/exponent units are preserved — `10-6 cm/s` is no longer corrupted, molar units are case-sensitive (`uM` ≠ micrometre), and dimensionless units (`ratio`, `fold`, `%`) keep their value. Unparseable units are kept with a warning.
+- **Endpoint mapping**: exact CYP-isoform mapping (`CYP1A1`/`CYP2C8` have no GIST slot → left unmapped; `CYP3A4_MDZ`/`CYP3A4_TST` merge into `CYP3A4_Inhibitor`), whole-token matching so `tr`/`gr` no longer leak into `transporter`, and qualitative `Positive`/`Negative` (stored in `Measurement_Unit`) encoded as `1`/`0`.
+- **No silent loss**: rows whose endpoint has no GIST column (e.g. Cytotoxicity, Genetoxicity, pKa/MW, Phase-II metabolism) are reported and written to `*_unmapped.csv` (CLI) instead of being dropped silently.
+
+> ⚠️ Core classes (`UnitConverter`, `pHCorrector`, `DataInspector`, `Preprocessor`, and the endpoint mapper) are duplicated across `hits-preprocess.py` (CLI) and `data.py` (Python API). Logic changes must be applied to **both**.
+
 ## Features
 - **SMILES Standardization**:
   - Removes salts, isotopes, and stereochemistry (optional).
@@ -21,7 +34,7 @@ This repository will be updated when the K-MELLODDY standard data format is chan
 - **pH Correction**:
   - **NEW**: Corrects pH-dependent activity values to a target pH (default: 7.4, physiological pH).
   - Supports three correction methods: Henderson-Hasselbalch equation, empirical correction, and molecular properties-based correction.
-  - Automatically detects pH-related data when 'pH' is found in Test_Type column.
+  - Infers pH from `Test_Subject` (`pH7.4`), `Measurement_Condition` (bare number), and `Test_Type`, in addition to dedicated pH columns.
   - Creates new columns with pH-corrected values for each method.
   - Handles missing pH data gracefully.
 - **Input File Support**:
@@ -81,9 +94,10 @@ This pipeline can convert K-MELLODDY standard data into a GIST format matrix whe
 - **Integrated Endpoint Mapping**: Rule-based endpoint matching with 100+ predefined synonyms (fully offline, no API required)
 - **Three-Tier Matching Strategy**:
   1. **Exact Match**: Direct lookup in synonym dictionary
-  2. **Substring Match**: Prioritizes longer, more specific matches
-  3. **Similarity Match**: Token overlap and sequence similarity (with special handling for CYP endpoints)
-- **CYP Endpoint Protection**: Prevents false positives (e.g., CYP2C9 ↔ CYP2D6) by requiring exact CYP number matches
+  2. **Whole-Token Match**: Contiguous token-sequence matching (prefers the longest, latest match) so short keys like `tr`/`gr` do not substring-match inside `transporter`
+  3. **Similarity Match**: Token overlap and sequence similarity (fallback)
+- **CYP Endpoint Protection**: A regex-based CYP guard (in **both** mappers) maps only the exact isoform; `CYP1A1`/`CYP2C8` (no GIST slot) stay unmapped and `CYP3A4_MDZ`/`CYP3A4_TST` merge into `CYP3A4_Inhibitor`
+- **Unmappable Endpoints**: Endpoints with no GIST column (`Cytotoxicity`, `Genetoxicity`) are never force-mapped via similarity; they are reported to `*_unmapped.csv`
 - **SI Unit Conversion**: Automatically converts units to SI using the built-in `UnitConverter`
 - **Missing Data Handling**: Uses `NaN` by default to distinguish between actual zero measurements and missing data (configurable via `fill_missing` parameter)
 - **PK Data Support**: For PK (patient-origin) data, duplicate rows per SMILES are preserved with aggregated measurements
@@ -98,7 +112,7 @@ This pipeline can convert K-MELLODDY standard data into a GIST format matrix whe
   - Automatically falls back to `manual` mode if credentials or dependencies are missing
 
 ### GIST Endpoint List
-The list of GIST endpoints is hardcoded in `data.py` (no external file dependency). Includes 70+ standardized endpoints covering:
+The list of GIST endpoints is defined in `gist/gist_format.txt` (and mirrored in `data.py`). It contains 86 standardized endpoint columns covering:
 - Permeability (Caco2, PAMPA, HIA, BBB, etc.)
 - Transporters (P-gp, BCRP, OATP, MATE, OCT2)
 - CYPs (CYP1A2, CYP2B6, CYP2C9, CYP2C19, CYP2D6, CYP3A4 as Inhibitor/Substrate)
@@ -153,6 +167,8 @@ gist_matrix.to_csv('output_gist_matrix.csv', index=False)
 ### Generated Files
 - `*_gist_matrix.csv`: GIST format matrix (SMILES × GIST endpoints)
 - `*_PK_gist_matrix.csv`: If PK rows detected (includes aggregated measurements)
+- `*_unmapped.csv`: **NEW** — rows whose endpoint has no GIST column (reported instead of silently dropped)
+- `*_HumanPK.csv`: **NEW** — Human PK workbooks (wide-format, non-GIST schema) written out separately
 - Corresponding `*_gist_matrix_metadata.json`: Processing metadata (if using CLI)
 
 ## Installation
@@ -257,15 +273,18 @@ Optional but recommended columns:
 - **Test_Dose**: Specifies dosage information (automatically included for Pharmacokinetics tests).
 - **Chemical_ID**: Compound identifier (will be included in molecule visualizations if present).
 - **Measurement_Unit**: Unit of measurement (e.g., μg/mL, μM, hours) for unit conversion to SI units. Creates `measurement_value_si` and `measurement_unit_si` columns.
-- **pH-related columns**: pH value column (e.g., pH, pH_Value, Measurement_pH) for pH correction when Test_Type contains 'pH'. **NEW**: pH can be automatically inferred from Test_Type if pH column is missing.
+- **pH-related columns**: pH value column (e.g., pH, pH_Value, Measurement_pH) for pH correction. **NEW (v4.6)**: pH is also inferred from `Test_Subject` (`pH7.4`), `Measurement_Condition` (bare number), or `Test_Type` when no dedicated pH column exists.
 - **Test**: Test identifier (e.g., 'Pharmacokinetics', 'ADMET').
 - **Test_Type**: Type of test (e.g., 'pH4.0', 'pH 7.4').
 - **Measurement_Type**: Type of measurement.
 
-**NEW**: Additional columns in new K-MELLODDY format:
-- **Measurement_Conc**: Concentration information for measurements.
+**NEW**: Additional columns in the v4.6 K-MELLODDY format:
+- **Measurement_Conc**: Concentration information for measurements (implicit `uM`).
 - **Measurement_Temp**: Temperature information for measurements.
-- **Measurement_Class**: Classification information for measurements.
+- **Measurement_Class**: Classification information (multi-meaning; used as a group key so different meanings are not merged).
+- **Measurement_Condition**: Assay condition (e.g. pH for Permeability/BBB/PPB).
+- **Measurement_Route / Measurement_Sex / Measurement_Formulation**: VIVO PK metadata (included in task grouping).
+- **Measurement_Value(AtoB) / Measurement_Value(BtoA)**: Permeability directional values (bracket lists).
 
 ### Special Cases Handling
 The pipeline includes special handling for certain data types:
