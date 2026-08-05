@@ -214,7 +214,7 @@ python hits-preprocess.py \
 | `--output_path` | Directory to save processed data (default: ./processed_data) |
 | `--visualize` | Generate visualizations (True/False) |
 | `--parallel` | Use parallel processing for large datasets (True/False) |
-| `--scale_activity` | Scale activity values (True/False) |
+| `--scale_activity` | Standard-scale activity values (True/False, default: **False**). The scaler is fit on the local dataset, so scaled labels are not comparable across institutions — keep it off for federated learning |
 | `--convert_units` | Convert units to SI units (True/False) |
 | `--correct_pH` | Correct pH-dependent activity values (True/False) |
 | `--pH_method` | pH correction method (all, henderson_hasselbalch, empirical, molecular_properties) |

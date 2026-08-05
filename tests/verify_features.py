@@ -141,4 +141,63 @@ print("normalized columns:", list(insp2.df.columns))
 print("μM ->", repr(insp2.df["measurement_unit"].iloc[0]),
       "| 25°C ->", repr(insp2.df["measurement_temp"].iloc[0]))
 
+# ------------------------------------------------------- 10. invalid SMILES drop
+hr("10. Invalid SMILES removal (Preprocessor.preprocess)")
+VALID20 = ["CCO","c1ccccc1","CC(=O)Oc1ccccc1C(=O)O","CCN","CCC","CCCC","CCCCC",
+           "c1ccncc1","CC(C)O","CCOC","CC(=O)N","CCS","CCCl","CCBr","CCI",
+           "c1ccc2ccccc2c1","CC(C)(C)O","CCCCO","CCCCCC","C1CCCCC1"]
+
+def long_frame(smis, vals, **extra):
+    d = {"smiles_structure_parent": smis, "measurement_value": vals,
+         "measurement_unit": ["uM"] * len(smis), "test": ["Caco2"] * len(smis)}
+    d.update({k: [v] * len(smis) for k, v in extra.items()})
+    return pd.DataFrame(d)
+
+# Each case previously kept the None row: a lone invalid SMILES is unique so
+# drop_duplicates(keep=False) never matched it, and dedup is skipped entirely
+# for keep_duplicates=True / Pharmacokinetics data.
+for label, frame in {
+    "1 invalid, all unique":  long_frame(VALID20[:3] + ["bad!!!"], [1.0,2.0,3.0,4.0]),
+    "keep_duplicates=True":   long_frame(VALID20[:2] + ["b1!!","b2??"], [1.0,2.0,3.0,4.0]),
+    "Pharmacokinetics data":  long_frame(VALID20[:3] + ["bad!!!"], [1.0,2.0,3.0,4.0],
+                                         test="Pharmacokinetics"),
+}.items():
+    kw = {"keep_duplicates": True} if label == "keep_duplicates=True" else {}
+    res = D.Preprocessor(frame, task_type="regression", task="t",
+                         correct_pH=False, **kw).preprocess()
+    print(f"{label:24s} -> rows={len(res)}  None remaining={int(res['Standardized_SMILES'].isna().sum())}")
+
+# ------------------------------------------------------- 11. outlier robustness
+hr("11. detect_outliers on NaN / censored / small samples")
+# Before the index-alignment fix these raised ValueError (mask length mismatch)
+# and TypeError (quantile on object dtype); n<8 fell through to LOF silently.
+nan_vals = [np.nan] + [float(i) for i in range(1, 20)]
+cens_vals = [float(i) for i in range(20)]; cens_vals[1] = ">100"
+for label, frame in {
+    "NaN in activity":     long_frame(VALID20, nan_vals),
+    "censored '>100'":     long_frame(VALID20, cens_vals),
+    "small sample (n=5)":  long_frame(VALID20[:5], [1.0,2.0,3.0,4.0,100.0]),
+}.items():
+    try:
+        res = D.Preprocessor(frame, task_type="regression", task="t",
+                             detect_outliers=True, keep_duplicates=True,
+                             correct_pH=False).preprocess()
+        col = res["measurement_value"]
+        # pandas 3.0 keeps NaN as a float under astype(str), so count it via isna()
+        print(f"{label:22s} -> rows={len(res)}  "
+              f"NaN kept={int(col.isna().sum())}  "
+              f"censored kept={int((col == '>100').sum())}")
+    except Exception as e:
+        print(f"{label:22s} -> ERROR {type(e).__name__}: {e}")
+
+# ------------------------------------------------------- 12. scale_activity off
+hr("12. scale_activity default (off for federated learning)")
+base = long_frame(VALID20[:5], [1.0,2.0,3.0,4.0,5.0])
+for label, kw in {"default": {}, "scale_activity=True": {"scale_activity": True}}.items():
+    res = D.preprocess_dataframe(base.copy(), task_type="regression", task="t",
+                                 correct_pH=False, **kw)
+    scaled = [c for c in res.columns if c.endswith("_scaled")]
+    print(f"{label:20s} -> scaled columns={scaled}  raw column present="
+          f"{'measurement_value' in res.columns}")
+
 print("\nALL CHECKS COMPLETED")

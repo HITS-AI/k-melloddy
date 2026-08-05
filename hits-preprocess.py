@@ -63,7 +63,7 @@ class PreprocessConfig:
     gist_output: Optional[str] = None
     visualize: bool = False
     parallel: bool = False
-    scale_activity: bool = True
+    scale_activity: bool = False
     convert_units: bool = True
     correct_pH: bool = False
     pH_method: str = "all"
@@ -126,7 +126,9 @@ def _print_help() -> None:
           --gist_output PATH         Explicit output CSV path for GIST matrix.
           --visualize [bool]         Generate visualizations (default: false).
           --parallel [bool]          Enable multiprocessing pipeline (default: false).
-          --scale_activity [bool]    Scale activity values (default: true).
+          --scale_activity [bool]    Standard-scale activity values (default: false;
+                                     scaler is fit per site, so scaled labels are
+                                     not comparable across federated institutions).
           --convert_units [bool]     Convert measurement units to SI (default: true).
           --correct_pH [bool]        Apply pH correction (default: false).
           --pH_method CHOICE         pH correction method: all|henderson_hasselbalch|empirical|molecular_properties.
@@ -1457,7 +1459,7 @@ class Preprocessor:
                  keep_stereo:bool=False, 
                  keep_duplicates:bool=False,
                  detect_outliers:bool=False,
-                 scale_activity:bool=True,
+                 scale_activity:bool=False,
                  convert_units:bool=True,
                  correct_pH:bool=True,
                  pH_method:str='all',
@@ -1482,6 +1484,9 @@ class Preprocessor:
         self.pH_method = pH_method
         self.target_pH = target_pH
         self.active_is_high:bool = True
+        # Empty until detect_outlier_from_distribution runs, so preprocess() can
+        # drop self.outliers.index unconditionally.
+        self.outliers = self.df.iloc[0:0]
         self.final_cols = []
         self.smiles_column = smiles_column
         self.remover = SaltRemover.SaltRemover()
@@ -1608,10 +1613,21 @@ class Preprocessor:
         self.label_type = label_type
     
     def detect_outlier_from_distribution(self):
-        activity_data = self.df[self.activity_col].dropna()
-        stat, p_value = normaltest(activity_data)
-        
-        if p_value >= 0.05:
+        """Outlier masks are built from the numeric subset and mapped back by
+        index label, so rows with NaN/censored activity are kept rather than
+        crashing the pipeline on a length mismatch."""
+        numeric = self._numeric_activity()
+        # normaltest needs >= 8 samples; below that scipy returns NaN (no raise)
+        # and 'NaN >= 0.05' would silently fall through to the density path.
+        if len(numeric) < 8:
+            logger.warning(
+                f"Only {len(numeric)} numeric activity value(s); skipping outlier "
+                f"detection (normaltest requires at least 8).")
+            self.outliers = self._no_outliers()
+            return
+        stat, p_value = normaltest(numeric)
+
+        if pd.isna(p_value) or p_value >= 0.05:
             print("The data follows a normal distribution. Applying statistical outlier detection.")
             self.outliers = self.detect_outliers_statistical()
         else:
@@ -1693,39 +1709,59 @@ class Preprocessor:
         self.df["Scaffold"] = scaffolds
         self.final_cols+=["Standardized_SMILES", "Scaffold"]
     
+    def _numeric_activity(self):
+        """Activity values coerced to float, non-numeric dropped, index preserved.
+        Censored values ('>100') and blanks become NaN and are excluded from
+        outlier judgement, but their rows stay in self.df."""
+        return pd.to_numeric(self.df[self.activity_col], errors='coerce').dropna()
+
+    def _no_outliers(self):
+        """Empty frame with self.df's schema: 'nothing detected' sentinel."""
+        return self.df.iloc[0:0]
+
     def detect_outliers_statistical(self):
-        q1 = self.df[self.activity_col].quantile(0.25)
-        q3 = self.df[self.activity_col].quantile(0.75)
+        numeric = self._numeric_activity()
+        if numeric.empty:
+            return self._no_outliers()
+        q1 = numeric.quantile(0.25)
+        q3 = numeric.quantile(0.75)
         iqr = q3 - q1
         lower_bound = q1 - 1.5 * iqr
         upper_bound = q3 + 1.5 * iqr
-        outliers = self.df[(self.df[self.activity_col] < lower_bound)|(self.df[self.activity_col] > upper_bound)]
+        outliers = self.df.loc[numeric.index[(numeric < lower_bound)|(numeric > upper_bound)]]
         print(f"Found {len(outliers)} outliers using IQR method.")
         return outliers
 
     def detect_outliers_density_based(self):
-        activity_data = self.df[[self.activity_col]].dropna()
-        lof = LocalOutlierFactor(n_neighbors=20)
-        labels = lof.fit_predict(activity_data)
-        outliers = self.df[labels == -1]
+        numeric = self._numeric_activity()
+        if len(numeric) < 3:
+            return self._no_outliers()
+        lof = LocalOutlierFactor(n_neighbors=min(20, len(numeric) - 1))
+        labels = lof.fit_predict(numeric.to_frame())
+        outliers = self.df.loc[numeric.index[labels == -1]]
         print(f"Found {len(outliers)} outliers using LOF.")
         return outliers
 
     def detect_outliers_classification_based(self):
-        activity_data = self.df[[self.activity_col]].dropna()
+        numeric = self._numeric_activity()
+        if numeric.empty:
+            return self._no_outliers()
         svm = OneClassSVM(kernel='rbf', gamma='auto')
-        labels = svm.fit_predict(activity_data)
-        outliers = self.df[labels == -1]
+        labels = svm.fit_predict(numeric.to_frame())
+        outliers = self.df.loc[numeric.index[labels == -1]]
         print(f"Found {len(outliers)} outliers using OneClassSVM.")
         return outliers
-    
+
     def detect_outliers_model_based(self):
-        activity_data = self.df[[self.activity_col]].dropna()
+        numeric = self._numeric_activity()
+        if len(numeric) < 2:
+            return self._no_outliers()
         gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
+        activity_data = numeric.to_frame()
         gmm.fit(activity_data)
         scores = gmm.score_samples(activity_data)
         threshold = np.percentile(scores, 5)
-        outliers = self.df[scores < threshold]
+        outliers = self.df.loc[numeric.index[scores < threshold]]
         print(f"Found {len(outliers)} outliers using Gaussian Mixture.")
         return outliers
         
@@ -1803,10 +1839,9 @@ class Preprocessor:
                 if 'Classification_label' not in self.df.columns:
                     self.create_classification_label(labels)
             
-            # Process numeric data
-            if self.detect_outliers:
-                self.detect_outlier_from_distribution()
-                
+            # Outlier detection/removal is driven by preprocess(); it used to run
+            # here too, doing the same work twice and discarding this result.
+
             # Apply scaling (numeric only). Use the pandas dtype API: under
             # pandas 3.0 np.issubdtype(StringDtype, np.number) raises.
             is_numeric = pd.api.types.is_numeric_dtype(labels)
@@ -1873,9 +1908,10 @@ class Preprocessor:
         return inferred
 
     def preprocess(self):
-        compounds = self.df[self.smiles_col]
-        labels = self.df[self.activity_col]
-        
+        # Row-removing steps (invalid SMILES, outliers) run before label
+        # processing, and compounds/labels are read from self.df at the point of
+        # use so their index always matches the current frame.
+
         # Perform unit conversion if enabled and unit column exists
         if self.convert_units and 'Measurement_Unit' in self.df.columns:
             logger.info("Starting unit conversion to SI units...")
@@ -1963,12 +1999,24 @@ class Preprocessor:
             else:
                 logger.info("No pH-related data found. pH correction skipped.")
         
-        self.preprocess_compounds(compounds)
-        self.preprocess_labels(labels)
+        self.preprocess_compounds(self.df[self.smiles_col])
+
+        # Drop rows whose SMILES could not be parsed. These used to be removed
+        # only as a side effect of the NaN-vs-NaN duplicate match below, so a
+        # lone invalid SMILES (or any run with dedup disabled) kept a None row.
+        # preprocess_compounds already logs each failure, so only the total here.
+        invalid_mask = self.df["Standardized_SMILES"].isna()
+        invalid_count = int(invalid_mask.sum())
+        if invalid_count:
+            logger.warning(f"Removed {invalid_count} row(s) with invalid SMILES.")
+            self.df = self.df.loc[~invalid_mask]
+
         if self.detect_outliers:
             self.detect_outlier_from_distribution()
-            self.df.drop(self.outliers.index, inplace=True)
-            
+            self.df = self.df.drop(self.outliers.index)
+
+        self.preprocess_labels(self.df[self.activity_col])
+
         # Improved duplicate removal logic
         # Skip duplicate removal for Pharmacokinetics data
         is_pk_data = False
@@ -2023,11 +2071,21 @@ class DataVisualizer:
     """
     Class for data and chemical structure visualization
     """
-    def __init__(self, df, smiles_col='Standardized_SMILES', activity_col='Measurement_Value', scale_activity=True):
+    def __init__(self, df, smiles_col='Standardized_SMILES', activity_col='Measurement_Value', scale_activity=False):
         self.df = df
         self.smiles_col = smiles_col
         self.activity_col = f"{activity_col}_scaled" if scale_activity and f"{activity_col}_scaled" in df.columns else activity_col
         self.has_chemical_id = 'Chemical ID' in df.columns
+
+    def _activity_label(self, row):
+        """Format a row's activity for a plot label. The raw activity column can
+        hold strings (censored values, or numbers straight out of the CSV), so
+        format only what actually converts to a number."""
+        value = row.get(self.activity_col)
+        if pd.isna(value):
+            return None
+        numeric = pd.to_numeric(value, errors='coerce')
+        return f"{numeric:.2f}" if pd.notna(numeric) else str(value)
     
     def visualize_molecules(self, n_mols=10, output_path=None):
         """
@@ -2099,8 +2157,9 @@ class DataVisualizer:
                 title_parts = []
                 
                 # Add activity value if available
-                if pd.notna(row.get(self.activity_col)):
-                    title_parts.append(f"Activity: {row.get(self.activity_col):.2f}")
+                activity_label = self._activity_label(row)
+                if activity_label is not None:
+                    title_parts.append(f"Activity: {activity_label}")
                 
                 title_parts.append(f"\n")
                 
@@ -2145,8 +2204,9 @@ class DataVisualizer:
                             
                             # Create two-line legend
                             legend_parts = []
-                            if pd.notna(row.get(self.activity_col)):
-                                legend_parts.append(f"{row.get(self.activity_col):.2f}")
+                            activity_label = self._activity_label(row)
+                            if activity_label is not None:
+                                legend_parts.append(activity_label)
                             
                             if self.has_chemical_id and pd.notna(row.get('Chemical ID')):
                                 if legend_parts:
@@ -2194,8 +2254,15 @@ class DataVisualizer:
             logger.error(f"Activity column '{self.activity_col}' not found in dataframe")
             return
         
+        # Coerce first: a raw activity column of strings would otherwise be
+        # plotted as categories instead of a distribution.
+        values = pd.to_numeric(self.df[self.activity_col], errors='coerce').dropna()
+        if values.empty:
+            logger.warning(f"No numeric values in '{self.activity_col}'; skipping distribution plot")
+            return
+
         plt.figure(figsize=(10, 6))
-        sns.histplot(self.df[self.activity_col].dropna(), kde=True)
+        sns.histplot(values, kde=True)
         plt.title(f'Distribution of {self.activity_col}')
         plt.xlabel(self.activity_col)
         plt.ylabel('Frequency')
