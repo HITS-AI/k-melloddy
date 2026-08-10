@@ -10,7 +10,9 @@ to_gist_matrix: true
 # Processing toggles
 visualize: false
 parallel: false
-scale_activity: true
+# Off by default: StandardScaler is fit on one site's local distribution, so
+# scaled labels are not comparable across federated institutions.
+scale_activity: false
 convert_units: true
 
 # Endpoint mapping
@@ -29,7 +31,8 @@ split: null      # one of [random, scaffold, stratified]; null skips splitting
 test_size: 0.2
 valid_size: 0.1
 
-# Column names (raw-input defaults; the pipeline derives *_scaled / Standardized_SMILES).
+# Column names (raw-input defaults; the pipeline derives Standardized_SMILES, and
+# *_scaled only when scale_activity is enabled).
 activity_col: Measurement_Value
 smiles_col: SMILES_Structure_Parent
 
