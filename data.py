@@ -930,7 +930,10 @@ class UnitConverter:
 		low = u.lower()
 		low = low.replace('·', '*').replace('×', '*').replace('•', '*')
 		low = re.sub(r'\s+', '', low)
-		if re.fullmatch(r'(x)?10\^?-6cm/s(ec)?', low):
+		# Permeability is reported as 10-6, 10^-6, x10-6, 1e-6, 1x10-6 ... all of
+		# which mean the same thing. Without this the '1e-6' spellings fell
+		# through to pint and were converted to m/s while '10-6' was kept as-is.
+		if re.fullmatch(r'(1?[x*])?(10\^?-6|1e-6|1[x*]10\^?-6)cm/s(ec)?', low):
 			return '1e-6 cm/s'
 		if low in ('ratio', 'fold', 'x'):
 			return low
@@ -1276,6 +1279,151 @@ def _expand_permeability_columns(df):
 	df['measurement_value_btoa'] = btoa_vals
 	df['measurement_efflux_ratio'] = ratio_vals
 	return df
+
+
+##### Replicate aggregation and percent-label normalization #####
+
+# Experimental-condition columns that, together with the SMILES, identify one
+# measurement context. Mirrors DataInspector.condition_columns.
+CONDITION_COLUMNS = ['test', 'test_type', 'test_subject', 'measurement_type',
+					'measurement_conc', 'measurement_temp', 'measurement_class',
+					'measurement_route', 'measurement_sex', 'measurement_formulation']
+
+_CENSOR_RE = re.compile(r'^\s*([<>]=?)')
+
+
+def _censor_flag(series):
+	"""Leading comparison operator of each value ('' when uncensored). Keeps
+	'>100' from being averaged together with exact measurements."""
+	return series.astype(str).str.extract(_CENSOR_RE, expand=False).fillna('')
+
+
+def aggregate_replicates(df, smiles_col, activity_col, condition_columns=None,
+						unit_col='measurement_unit', relation_col='measurement_relation'):
+	"""Collapse replicate measurements to one row per (compound, condition).
+
+	Replicates used to be deleted outright by drop_duplicates(keep=False), which
+	also removed rows that merely shared a SMILES across different endpoints.
+	The key here is the standardized SMILES plus every available experimental
+	condition (endpoint, unit, censoring), and replicates within a key are
+	summarized by the median of each activity-derived column. Values that are
+	not numeric (censored strings) are ignored by the median; a group with no
+	numeric value at all keeps its first row untouched.
+	"""
+	if df.empty or smiles_col not in df.columns:
+		return df
+
+	condition_columns = CONDITION_COLUMNS if condition_columns is None else condition_columns
+	key_cols = [smiles_col] + [c for c in condition_columns if c in df.columns]
+	for extra in (unit_col, relation_col):
+		if extra in df.columns and extra not in key_cols:
+			key_cols.append(extra)
+
+	# str() keeps NaN from splitting or dropping groups; the separator cannot
+	# appear in a cell, so distinct keys never collide.
+	parts = [df[c].astype(str) for c in key_cols]
+	if activity_col in df.columns:
+		parts.append(_censor_flag(df[activity_col]))
+	group_id = pd.Series(['\x1f'.join(vals) for vals in zip(*parts)], index=df.index)
+
+	if not group_id.duplicated().any():
+		return df
+
+	value_cols = [c for c in df.columns
+				if c == activity_col or c.startswith(f"{activity_col}_")]
+	base = df.groupby(group_id, sort=False).head(1).copy()
+	base_gid = group_id.loc[base.index]
+	for col in value_cols:
+		medians = pd.to_numeric(df[col], errors='coerce').groupby(group_id, sort=False).median()
+		mapped = base_gid.map(medians)
+		if mapped.notna().any():
+			# object dtype so a float median can land in a str column (pandas 3.0)
+			if not pd.api.types.is_numeric_dtype(base[col]):
+				base[col] = base[col].astype(object)
+			base.loc[mapped.notna(), col] = mapped[mapped.notna()]
+
+	logger.info(
+		"Aggregated %d replicate row(s) into %d row(s) by median "
+		"(key: %s + censoring).", len(df), len(base), ", ".join(key_cols))
+	return base.reset_index(drop=True)
+
+
+def normalize_percent_values(df, value_col, unit_col, endpoint_columns=None):
+	"""Bring percent-unit labels onto a single 0-100 scale and clip to it.
+
+	FDD data mixes 0-1 fractions with 0-100 percentages and carries values
+	outside 0-100. Scale is decided per endpoint group: only when every numeric
+	value in the group is <= 1 is it treated as a fraction and rescaled, since a
+	group holding both 0.8 and 80 is genuinely ambiguous. Out-of-range values
+	are then clipped, per FDD's requested policy.
+	"""
+	if df.empty or value_col not in df.columns or unit_col is None or unit_col not in df.columns:
+		return df
+
+	unit_norm = df[unit_col].astype(str).str.strip().str.lower()
+	percent_mask = unit_norm.isin(['%', 'percent'])
+	if not percent_mask.any():
+		return df
+
+	values = pd.to_numeric(df[value_col], errors='coerce')
+	endpoint_columns = ([c for c in (endpoint_columns or []) if c in df.columns]
+						or [c for c in ['gist_endpoint', 'test', 'test_type', 'measurement_type']
+							if c in df.columns])
+	if endpoint_columns:
+		group_id = pd.Series(
+			['\x1f'.join(vals) for vals in zip(*[df[c].astype(str) for c in endpoint_columns])],
+			index=df.index)
+	else:
+		group_id = pd.Series('__all__', index=df.index)
+
+	for gid, idx in group_id[percent_mask].groupby(group_id[percent_mask], sort=False).groups.items():
+		group_values = values.loc[idx].dropna()
+		if group_values.empty:
+			continue
+		if (group_values <= 1).all() and (group_values > 0).any():
+			values.loc[idx] = values.loc[idx] * 100
+			logger.info(
+				"Percent endpoint %r: all %d value(s) <= 1, rescaled from 0-1 to 0-100.",
+				gid, len(group_values))
+		elif (group_values <= 1).any():
+			logger.warning(
+				"Percent endpoint %r mixes %d value(s) <= 1 with %d value(s) > 1; "
+				"scale is ambiguous, leaving values unscaled.",
+				gid, int((group_values <= 1).sum()), int((group_values > 1).sum()))
+
+	out_of_range = percent_mask & values.notna() & ((values < 0) | (values > 100))
+	if out_of_range.any():
+		logger.warning(
+			"Clipped %d percent value(s) outside 0-100 (min %s, max %s).",
+			int(out_of_range.sum()), values[out_of_range].min(), values[out_of_range].max())
+
+	clipped = values.where(~percent_mask, values.clip(lower=0, upper=100))
+	df = df.copy()
+	# object dtype so floats can land in a str column (pandas 3.0)
+	if not pd.api.types.is_numeric_dtype(df[value_col]):
+		df[value_col] = df[value_col].astype(object)
+	df.loc[percent_mask, value_col] = clipped[percent_mask]
+	return df
+
+
+def warn_on_mixed_si_units(df, endpoint_col, unit_col):
+	"""Warn when one endpoint carries incompatible SI units.
+
+	Mass and molar concentrations are never reconciled (no MW conversion), so
+	ug/mL lands on kg/m**3 while uM lands on mole/m**3. Averaging across them
+	silently mixes scales, and FDD asked us to surface such cases."""
+	if df.empty or endpoint_col not in df.columns or unit_col not in df.columns:
+		return
+	units = df[[endpoint_col, unit_col]].dropna()
+	if units.empty:
+		return
+	for endpoint, group in units.groupby(endpoint_col, sort=False):
+		distinct = sorted(set(group[unit_col].astype(str)) - {'nan', ''})
+		if len(distinct) > 1:
+			logger.warning(
+				"Endpoint %r mixes %d incompatible unit(s) after SI conversion: %s. "
+				"Values are aggregated as-is (no molar/mass conversion).",
+				endpoint, len(distinct), ", ".join(distinct))
 
 
 class DataInspector:
@@ -1811,7 +1959,15 @@ class Preprocessor:
 					self.final_cols.append('measurement_unit_si')
 			except Exception:
 				pass
-		
+
+		# Percent labels: unify the 0-1 / 0-100 scale and clip, on the column
+		# downstream actually consumes so the raw measurement stays intact.
+		percent_value_col = (f"{self.activity_col}_si"
+							if f"{self.activity_col}_si" in self.df.columns
+							else self.activity_col)
+		self.df = normalize_percent_values(
+			self.df, percent_value_col, 'measurement_unit')
+
 		if self.correct_pH:
 			inferred_pH = self._infer_ph_column()
 			pH_data_mask = inferred_pH.notna()
@@ -1866,20 +2022,11 @@ class Preprocessor:
 			is_pk_data = True
 		
 		if not self.keep_duplicates and not is_pk_data:
-			before_count = len(self.df)
-			# Snapshot with all enriched columns (SI, pH_corrected, standardized)
-			# so recovery does not lose them if the strict dedup empties the set.
-			df_before_dedup = self.df.copy()
-			self.df.drop_duplicates(subset=["Standardized_SMILES"], keep=False, inplace=True, ignore_index=True)
-			after_count = len(self.df)
-			if after_count == 0 and before_count > 0:
-				# Recover from the fully-processed frame, keeping the first row per
-				# SMILES so all columns (SI/pH/standardized) survive.
-				self.df = df_before_dedup.drop_duplicates(
-					subset=["Standardized_SMILES"], keep='first', ignore_index=True)
-			else:
-				self.df.drop_duplicates(subset=["Standardized_SMILES"], keep='first', inplace=True, ignore_index=True)
-		
+			# Replicates are summarized by median rather than deleted; see
+			# aggregate_replicates for why the old keep=False dedup lost data.
+			self.df = aggregate_replicates(
+				self.df, "Standardized_SMILES", self.activity_col)
+
 		for col in [self.activity_col, 'test', 'test_type', 'test_subject', 'measurement_type']:
 			if col in self.df.columns and col not in self.final_cols:
 				self.final_cols.append(col)
@@ -2476,6 +2623,13 @@ def preprocess_to_gist(input_data, config=None, smiles_col='smiles_structure_par
 				{"positive": 1.0, "negative": 0.0})
 
 	df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
+
+	# Percent labels: unify the 0-1 / 0-100 scale per endpoint, then clip.
+	df = normalize_percent_values(df, value_col, unit_col, ['gist_endpoint'])
+
+	# Surface endpoints whose rows land on incompatible SI units before the
+	# groupby-mean below silently averages across them.
+	warn_on_mixed_si_units(df, 'gist_endpoint', 'unit_si' if 'unit_si' in df.columns else unit_col)
 
 	# Permeability: derive dimensionless Efflux_ratio (BtoA/AtoB) rows.
 	if 'measurement_efflux_ratio' in df.columns:
