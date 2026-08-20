@@ -4,6 +4,12 @@
 #  성적서 신청서 ONY-26-K027 4p 선언 환경을 그대로 재현한다.
 #
 #  사용법:  bash setup_test_env.sh        (제품 루트에서 실행)
+#
+#  Windows PC 라면 네이티브가 아니라 WSL2 에서 실행한다.
+#  신청서 4p 가 Ubuntu 24.04.1 LTS 를 시험대상 운영환경으로 선언했고
+#  절차 3) 이 `source .venv/bin/activate` 이므로 Windows 셸과는 맞지 않는다.
+#      PowerShell(관리자):  wsl --install -d Ubuntu-24.04
+#      Ubuntu 셸:           sudo apt install -y python3.12-venv git
 #  결과:    ./.venv  → 신청서 절차 3) 의 `source .venv/bin/activate` 가 그대로 동작
 # =============================================================================
 set -euo pipefail
@@ -32,7 +38,18 @@ for cand in python3.12 python3 python; do
 done
 
 if [ -z "$PY" ]; then
-  echo "[*] 사용 가능한 Python 3.12.3 없음 → conda 로 확보"
+  echo "[*] venv 를 만들 수 있는 Python 3.12.3 이 없습니다."
+  # Ubuntu 24.04 는 시스템 python3.12 가 이미 3.12.3 이지만
+  # python3.12-venv 패키지가 없으면 `python -m venv` 가 실패한다. 이게 가장 흔한 원인.
+  if [ "$(python3.12 -V 2>&1 | awk '{print $2}')" = "3.12.3" ]; then
+    echo "[!] python3.12 는 3.12.3 인데 venv 생성이 안 됩니다 → python3.12-venv 미설치."
+    echo "    아래를 실행한 뒤 이 스크립트를 다시 실행하세요 (권장):"
+    echo
+    echo "      sudo apt update && sudo apt install -y python3.12-venv"
+    echo
+    echo "    설치 없이도 진행 가능합니다 — 아래에서 conda 로 동일한 3.12.3 을 씁니다."
+  fi
+  echo "[*] conda 로 Python 3.12.3 확보"
   command -v conda >/dev/null 2>&1 \
     || { echo "[!] conda 없음. miniconda 설치 후 재실행:"; \
          echo "    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"; \
