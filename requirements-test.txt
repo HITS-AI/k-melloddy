@@ -1,0 +1,18 @@
+# K-MELLODDY 표준데이터 전처리 SW v1.0 — 시험환경 고정 버전
+# (성적서 신청서 ONY-26-K027 4p 선언 버전과 일치)
+
+# --- 신청서 4p 선언 필수 패키지 8종 ---
+pandas==3.0.3
+numpy==2.4.6
+rdkit==2025.3.2
+scikit-learn==1.6.1
+scipy==1.15.3
+Pint==0.24.4
+omegaconf==2.3.1
+openpyxl==3.1.5
+
+# --- data.py / hits-preprocess.py 최상단 import 로 필수 (미설치 시 즉시 ImportError) ---
+networkx==3.6.1
+matplotlib==3.10.3
+seaborn==0.13.2
+# torch 는 CPU 전용 휠로 별도 설치 (setup_test_env.sh 참조) — CUDA 휠은 약 6GB
